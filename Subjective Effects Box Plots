@@ -1,0 +1,172 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+# ============================================================
+#  Subjective Effects Box & Whisker Plot
+# ============================================================
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# ── 1. DATA ──────────────────────────────────────────────────
+data_list <- list(
+
+  P0016 = data.frame(
+    timepoint    = paste0("T", 1:9),
+    Drug_effects = c(0, 3, 4, 4, 4, 3, 1, 1, 1),
+    MEQ1         = c(0, 2, 4, 3, 3, 1, 1, 1, 0),
+    MEQ2         = c(1, 2, 3, 2, 2, 4, 4, 3, 3),
+    MEQ3         = c(0, 2, 4, 3, 4, 3, 1, 0, 0),
+    MEQ4         = c(0, 2, 3, 3, 5, 3, 3, 1, 1)
+  ),
+  P0005 = data.frame(
+    timepoint    = paste0("T", 1:9),
+    Drug_effects = c(0, 0, 1, 2, 2, 3, 3, 3, 2),
+    MEQ1         = c(1, 0, 1, 2, 4, 4, 4, 5, 5),
+    MEQ2         = c(4, 4, 4, 4, 4, 4, 3, 5, 5),
+    MEQ3         = c(0, 1, 1, 2, 2, 4, 3, 5, 5),
+    MEQ4         = c(0, 0, 0, 1, 1, 3, 1, 1, 1)
+  ),
+  P0007 = data.frame(
+    timepoint    = paste0("T", 1:9),
+    Drug_effects = c(0, 1, 2, 2, 2, 3, 4, 4, 2),
+    MEQ1         = c(1, 2, 2, 3, 3, 4, 5, 5, 4),
+    MEQ2         = c(3, 3, 3, 3, 4, 4, 4, 5, 3),
+    MEQ3         = c(1, 1, 2, 2, 3, 4, 5, 5, 2),
+    MEQ4         = c(2, 2, 2, 3, 2, 3, 5, 4, 2)
+  ),
+  P0008 = data.frame(
+    timepoint    = paste0("T", 1:9),
+    Drug_effects = c(0, 4, 5, NA, NA, 5, 2, 1, 1),
+    MEQ1         = c(1, 2, 4, NA, NA, 5, 3, 3, 3),
+    MEQ2         = c(3, 3, 3, NA, NA, 1, 4, 4, 4),
+    MEQ3         = c(0, 3, 5, NA, NA, 5, 2, 2, 1),
+    MEQ4         = c(0, 4, 5, NA, NA, 5, 2, 2, 2)
+  ),
+  P0011 = data.frame(
+    timepoint    = paste0("T", 1:9),
+    Drug_effects = c(0, 0, 2, 3, 3, 4, 4, 3, 2),
+    MEQ1         = c(2, 1, 1, 2, 1, 3, 3, 3, 3),
+    MEQ2         = c(4, 4, 4, 4, 4, 5, 5, 5, 5),
+    MEQ3         = c(0, 0, 0, 1, 1, 2, 1, 3, 0),
+    MEQ4         = c(0, 0, 0, 0, 1, 1, 1, 1, 0)
+  ),
+  P0012 = data.frame(
+    timepoint    = paste0("T", 1:9),
+    Drug_effects = c(0, 1, 4, 5, 5, 5, 4, 3, 2),
+    MEQ1         = c(1, 1, 2, 4, 1, 4, 4, 3, 2),
+    MEQ2         = c(2, 1, 2, 3, 2, 3, 1, 1, 1),
+    MEQ3         = c(0, 0, 3, 5, 5, 5, 5, 3, 3),
+    MEQ4         = c(0, 1, 4, 5, 5, 5, 5, 3, 3)
+  ),
+  P0013 = data.frame(
+    timepoint    = paste0("T", 1:9),
+    Drug_effects = c(0, 1, 4, 5, 5, 5, 2, 1, 0),
+    MEQ1         = c(0, 0, 4, 5, 5, 5, 3, 2, 2),
+    MEQ2         = c(2, 2, 4, 5, 5, 5, 4, 3, 3),
+    MEQ3         = c(0, 0, 4, 5, 5, 5, 3, 0, 0),
+    MEQ4         = c(0, 0, 3, 3, 3, 5, 0, 0, 0)
+  ),
+  P0017 = data.frame(
+    timepoint    = paste0("T", 1:9),
+    Drug_effects = c(0, 1, 2, 4, 5, 5, 5, 2, 1),
+    MEQ1         = c(2, 2, 3, 4, 3, 5, 5, 4, 4),
+    MEQ2         = c(4, 4, 5, 5, 3, 5, 5, 4, 5),
+    MEQ3         = c(0, 1, 1, 4, 5, 5, 5, 2, 0),
+    MEQ4         = c(0, 0, 2, 5, 5, 5, 5, 5, 4)
+  ),
+  P0018 = data.frame(
+    timepoint    = paste0("T", 1:9),
+    Drug_effects = c(0, 2, 3, 4, 4, 5, 4, 2, 1),
+    MEQ1         = c(1, 1, 2, 3, 3, 5, 3, 3, 2),
+    MEQ2         = c(4, 4, 4, 4, 4, 5, 2, 3, 3),
+    MEQ3         = c(1, 1, 3, 4, 4, 5, 4, 3, 3),
+    MEQ4         = c(1, 1, 2, 2, 3, 4, 3, 4, 4)
+  ),
+  P0019 = data.frame(
+    timepoint    = paste0("T", 1:9),
+    Drug_effects = c(0, 4, 5, 5, 4, 3, 2, 0, 0),
+    MEQ1         = c(0, 0, 2, 3, 3, 4, 2, 1, 1),
+    MEQ2         = c(3, 3, 5, 5, 3, 3, 3, 3, 3),
+    MEQ3         = c(0, 0, 2, 3, 5, 2, 1, 0, 0),
+    MEQ4         = c(0, 2, 5, 5, 5, 3, 1, 0, 0)
+  )
+
+) # <-- closing parenthesis for data_list
+
+# ── 2. COMBINE & RESHAPE ─────────────────────────────────────
+df <- bind_rows(data_list, .id = "participant") |>
+  mutate(MEQ_total = MEQ1 + MEQ2 + MEQ3 + MEQ4) |>  # <-- add this
+  pivot_longer(cols = c(Drug_effects, MEQ1, MEQ2, MEQ3, MEQ4, MEQ_total),
+               names_to  = "measure",
+               values_to = "score") |>
+  mutate(
+    timepoint = factor(timepoint, levels = paste0("T", 1:9)),
+    measure   = factor(measure,
+                       levels = c("Drug_effects","MEQ1","MEQ2","MEQ3","MEQ4","MEQ_total"),
+                       labels = c("Drug Effects","MEQ1","MEQ2","MEQ3","MEQ4","MEQ Total"))
+  )
+
+# Print n per timepoint (useful for checking missing data)
+df |>
+  group_by(measure, timepoint) |>
+  summarise(n = sum(!is.na(score)), .groups = "drop") |>
+  print()
+
+# ── 3. PLOT ──────────────────────────────────────────────────
+# Measures to include in each plot
+measures_individual <- c("Drug Effects", "MEQ1", "MEQ2", "MEQ3", "MEQ4")
+measures_total      <- c("MEQ Total")
+
+# ── Plot 1: individual measures (y = 0–5) ──
+p1 <- ggplot(df |> filter(measure %in% measures_individual), aes(x = timepoint, y = score)) +
+  geom_boxplot(aes(fill = measure), outlier.shape = NA,
+               width = 0.55, alpha = 0.75, colour = "grey30", linewidth = 0.4) +
+  geom_jitter(aes(colour = measure), width = 0.12, size = 1.8, alpha = 0.9, shape = 16) +
+  stat_summary(fun.data = function(x) data.frame(y = -0.25, label = sum(!is.na(x))),
+               geom = "text", size = 2.8, colour = "grey50") +
+  facet_wrap(~ measure, nrow = 1) +
+  scale_fill_manual(values  = c("#4C72B0","#DD8452","#55A868","#C44E52","#8172B3")) +
+  scale_colour_manual(values = c("#2a5298","#b85a20","#2e7d4f","#8b1a1a","#4a3a8a")) +
+  scale_y_continuous(breaks = 0:5, limits = c(-0.5, 5.5)) +
+  labs(title = "Subjective Effects by Timepoint",
+       subtitle = "Box = IQR, line = median, points = individual scores, number = n",
+       x = "Timepoint", y = "Score") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        strip.text = element_text(face = "bold", size = 11),
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(colour = "grey50", size = 10),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.text.x = element_text(size = 9))
+
+# ── Plot 2: MEQ Total (y = 0–20) ──
+p2 <- ggplot(df |> filter(measure %in% measures_total), aes(x = timepoint, y = score)) +
+  geom_boxplot(fill = "#937860", outlier.shape = NA,
+               width = 0.55, alpha = 0.75, colour = "grey30", linewidth = 0.4) +
+  geom_jitter(colour = "#5c4a30", width = 0.12, size = 1.8, alpha = 0.9, shape = 16) +
+  stat_summary(fun.data = function(x) data.frame(y = -0.5, label = sum(!is.na(x))),
+               geom = "text", size = 2.8, colour = "grey50") +
+  scale_y_continuous(breaks = seq(0, 20, 2), limits = c(-1, 21)) +
+  labs(title = "MEQ Total Score by Timepoint",
+       subtitle = "Box = IQR, line = median, points = individual scores, number = n",
+       x = "Timepoint", y = "Total Score (0–20)") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(colour = "grey50", size = 10),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.text.x = element_text(size = 9))
+
+# ── View both ──
+p1
+p2
