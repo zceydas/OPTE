@@ -170,3 +170,72 @@ p2 <- ggplot(df |> filter(measure %in% measures_total), aes(x = timepoint, y = s
 # ── View both ──
 p1
 p2
+```
+
+```{r}
+# ============================================================
+# Test MEQ Total Score for Quadratic Trend Over Time
+# ============================================================
+
+library(lme4)
+library(lmerTest)
+
+meq_total_df <- df |>
+  filter(measure == "MEQ Total") |>
+  mutate(
+    time_num = as.numeric(timepoint),          # T1 = 1, T2 = 2, ..., T9 = 9
+    time_centered = time_num - mean(time_num)  # centered time
+  ) |>
+  filter(!is.na(score))
+
+# Linear time model
+m_linear <- lmer(
+  score ~ time_centered + (1 | participant),
+  data = meq_total_df
+)
+
+# Quadratic time model
+m_quadratic <- lmer(
+  score ~ time_centered + I(time_centered^2) + (1 | participant),
+  data = meq_total_df
+)
+
+# Model summary: check p-value for I(time_centered^2)
+summary(m_quadratic)
+
+# Formal test: does quadratic term improve model fit?
+anova(m_linear, m_quadratic)
+
+# Optional: Type III test of fixed effects
+anova(m_quadratic, type = 3)
+
+# ============================================================
+# Effect Size for Quadratic Trend
+# ============================================================
+
+library(performance)
+
+# Marginal and conditional R²
+r2(m_quadratic)
+
+# Compare models with vs without quadratic term
+
+library(performance)
+
+m_linear <- lmer(
+  score ~ time_centered + (1 | participant),
+  data = meq_total_df
+)
+
+m_quadratic <- lmer(
+  score ~ time_centered + I(time_centered^2) + (1 | participant),
+  data = meq_total_df
+)
+
+r2_linear <- r2(m_linear)$R2_marginal
+r2_quad   <- r2(m_quadratic)$R2_marginal
+
+delta_r2 <- r2_quad - r2_linear
+
+delta_r2
+```
