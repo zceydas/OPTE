@@ -1,0 +1,399 @@
+%% lzc_heatmap.m
+% Batch channel-wise LZc analysis for:
+%   participants sessions eyes-open/eyes-closed
+%
+% Computes LZc using multiple shuffle normalization depths:
+%   1, 5, 10, 50, 100 shuffles
+%
+% Figures use LZc_100 by default.
+%
+% Outputs:
+%   - per-file channel-wise LZc CSV
+%   - per-file MAT ou  tput
+%   - per-file channel heatmap
+%   - per-file scalp topoplot
+%   - average heatmap/topoplot for each session × eye condition
+%   - combined 2 × 5 group summary heatmap figure
+%   - combined 2 × 5 group summary topoplot figure
+
+clear; clc;
+format long g
+
+%% ---------------- USER SETTINGS ----------------
+
+seed = 0;
+nShuffles_list = [1 5 10 50 100];
+plot_lzc_column = "LZc_100";
+
+input_root = uigetdir(pwd, 'Select folder containing EEGLAB .set files');
+if isequal(input_root, 0)
+    disp('Folder selection cancelled.');
+    return;
+end
+
+output_root = fullfile(input_root, 'LZc_Results');
+if ~exist(output_root, 'dir')
+    mkdir(output_root);
+end
+
+session_order = {'baseline', 'dosing', '1week', '2week', '1month'};
+session_labels = {'Baseline', 'Dosing', '1 Week', '2 Week', '1 Month'};
+
+eyes_order = {'EO', 'EC'};
+eyes_labels = {'Eyes Open', 'Eyes Closed'};
+
+%% ---------------- FIND FILES ----------------
+
+set_files = dir(fullfile(input_root, '**', '*.set'));
+
+if isempty(set_files)
+    error('No .set files found under: %s', input_root);
+end
+
+fprintf('\nFound %d .set files.\n', numel(set_files));
+
+all_results = table();
+
+template_chanlocs = [];
+template_labels = strings(0,1);
+
+%% ---------------- PROCESS EACH FILE ----------------
+
+for f = 1:numel(set_files)
+
+    file = set_files(f).name;
+    path = set_files(f).folder;
+    set_path = fullfile(path, file);
+    [~, base_name, ~] = fileparts(file);
+
+    fprintf('\n====================================================\n');
+    fprintf('Processing %d/%d:\n%s\n', f, numel(set_files), set_path);
+
+    info = parse_lzc_filename(base_name);
+
+    if info.skip
+        fprintf('Skipping file because participant/session/eyes condition could not be parsed.\n');
+        continue;
+    end
+
+    EEG = pop_loadset('filename', file, 'filepath', path);
+    X = double(EEG.data);
+
+    [nChannels, ~] = size(X);
+
+    chan_labels = get_channel_labels(EEG, nChannels);
+
+    if isempty(template_chanlocs) && isfield(EEG, 'chanlocs') && numel(EEG.chanlocs) >= nChannels
+        template_chanlocs = EEG.chanlocs;
+        template_labels = chan_labels;
+    end
+
+    LZc_1 = nan(nChannels, 1);
+    LZc_5 = nan(nChannels, 1);
+    LZc_10 = nan(nChannels, 1);
+    LZc_50 = nan(nChannels, 1);
+    LZc_100 = nan(nChannels, 1);
+
+    c_orig_values = nan(nChannels, 1);
+    c_shuf_mean_1 = nan(nChannels, 1);
+    c_shuf_mean_5 = nan(nChannels, 1);
+    c_shuf_mean_10 = nan(nChannels, 1);
+    c_shuf_mean_50 = nan(nChannels, 1);
+    c_shuf_mean_100 = nan(nChannels, 1);
+
+    c_shuf_sd_1 = nan(nChannels, 1);
+    c_shuf_sd_5 = nan(nChannels, 1);
+    c_shuf_sd_10 = nan(nChannels, 1);
+    c_shuf_sd_50 = nan(nChannels, 1);
+    c_shuf_sd_100 = nan(nChannels, 1);
+
+    threshold_values = nan(nChannels, 1);
+    all_out = cell(nChannels, 1);
+
+    for ch = 1:nChannels
+
+        fprintf('  Channel %d/%d: %s\n', ch, nChannels, chan_labels(ch));
+
+        X_ch = X(ch, :);
+
+        [lz_vals, out] = LZc_baseline_multishuffle(X_ch, seed + ch, nShuffles_list);
+
+        LZc_1(ch)   = lz_vals(nShuffles_list == 1);
+        LZc_5(ch)   = lz_vals(nShuffles_list == 5);
+        LZc_10(ch)  = lz_vals(nShuffles_list == 10);
+        LZc_50(ch)  = lz_vals(nShuffles_list == 50);
+        LZc_100(ch) = lz_vals(nShuffles_list == 100);
+
+        c_orig_values(ch) = out.c_orig;
+
+        c_shuf_mean_1(ch)   = out.c_shuf_means(nShuffles_list == 1);
+        c_shuf_mean_5(ch)   = out.c_shuf_means(nShuffles_list == 5);
+        c_shuf_mean_10(ch)  = out.c_shuf_means(nShuffles_list == 10);
+        c_shuf_mean_50(ch)  = out.c_shuf_means(nShuffles_list == 50);
+        c_shuf_mean_100(ch) = out.c_shuf_means(nShuffles_list == 100);
+
+        c_shuf_sd_1(ch)   = out.c_shuf_sds(nShuffles_list == 1);
+        c_shuf_sd_5(ch)   = out.c_shuf_sds(nShuffles_list == 5);
+        c_shuf_sd_10(ch)  = out.c_shuf_sds(nShuffles_list == 10);
+        c_shuf_sd_50(ch)  = out.c_shuf_sds(nShuffles_list == 50);
+        c_shuf_sd_100(ch) = out.c_shuf_sds(nShuffles_list == 100);
+
+        threshold_values(ch) = out.TH(1);
+
+        all_out{ch} = out;
+
+    end
+
+    plot_LZc_values = LZc_100;
+
+    participant_dir = fullfile(output_root, info.participant);
+    if ~exist(participant_dir, 'dir')
+        mkdir(participant_dir);
+    end
+
+    file_tag = sprintf('%s_%s_%s_%s', ...
+        info.participant, info.session, info.eyes, base_name);
+
+    results_table = table( ...
+        repmat(string(info.participant), nChannels, 1), ...
+        repmat(string(info.session), nChannels, 1), ...
+        repmat(string(info.eyes), nChannels, 1), ...
+        repmat(string(base_name), nChannels, 1), ...
+        chan_labels, ...
+        LZc_1, ...
+        LZc_5, ...
+        LZc_10, ...
+        LZc_50, ...
+        LZc_100, ...
+        c_orig_values, ...
+        c_shuf_mean_1, ...
+        c_shuf_mean_5, ...
+        c_shuf_mean_10, ...
+        c_shuf_mean_50, ...
+        c_shuf_mean_100, ...
+        c_shuf_sd_1, ...
+        c_shuf_sd_5, ...
+        c_shuf_sd_10, ...
+        c_shuf_sd_50, ...
+        c_shuf_sd_100, ...
+        threshold_values, ...
+        'VariableNames', {'Participant','Session','Eyes','File','Channel', ...
+        'LZc_1','LZc_5','LZc_10','LZc_50','LZc_100', ...
+        'c_orig', ...
+        'c_shuf_mean_1','c_shuf_mean_5','c_shuf_mean_10','c_shuf_mean_50','c_shuf_mean_100', ...
+        'c_shuf_sd_1','c_shuf_sd_5','c_shuf_sd_10','c_shuf_sd_50','c_shuf_sd_100', ...
+        'Threshold'} ...
+    );
+
+    csv_path = fullfile(participant_dir, [file_tag '_LZc_by_channel.csv']);
+    writetable(results_table, csv_path);
+
+    mat_path = fullfile(participant_dir, [file_tag '_LZc_outputs.mat']);
+    save(mat_path, ...
+        'results_table', ...
+        'LZc_1', ...
+        'LZc_5', ...
+        'LZc_10', ...
+        'LZc_50', ...
+        'LZc_100', ...
+        'c_orig_values', ...
+        'threshold_values', ...
+        'all_out', ...
+        'chan_labels', ...
+        'set_path', ...
+        'seed', ...
+        'nShuffles_list', ...
+        '-v7.3');
+
+    plot_channel_heatmap(plot_LZc_values, chan_labels, ...
+        [file_tag ' Channel-wise LZc using ' char(plot_lzc_column)], ...
+        fullfile(participant_dir, [file_tag '_' char(plot_lzc_column) '_channel_heatmap.png']));
+
+    if exist('topoplot', 'file') == 2 && isfield(EEG, 'chanlocs')
+        plot_lzc_topoplot(plot_LZc_values, EEG.chanlocs, ...
+            [file_tag ' LZc Topoplot using ' char(plot_lzc_column)], ...
+            fullfile(participant_dir, [file_tag '_' char(plot_lzc_column) '_topoplot.png']));
+    end
+
+    all_results = [all_results; results_table];
+
+end
+
+%% ---------------- SAVE COMBINED TABLE ----------------
+
+if isempty(all_results)
+    error('No valid files were processed. Check parse_lzc_filename() and your file naming.');
+end
+
+combined_csv = fullfile(output_root, 'ALL_LZc_by_channel.csv');
+writetable(all_results, combined_csv);
+
+combined_mat = fullfile(output_root, 'ALL_LZc_by_channel.mat');
+save(combined_mat, 'all_results', 'seed', 'nShuffles_list', 'plot_lzc_column', '-v7.3');
+
+fprintf('\nSaved combined table:\n%s\n', combined_csv);
+
+%% ---------------- AVERAGE ACROSS PARTICIPANTS ----------------
+
+avg_dir = fullfile(output_root, 'Group_Averages');
+if ~exist(avg_dir, 'dir')
+    mkdir(avg_dir);
+end
+
+avg_results = table();
+
+for s = 1:numel(session_order)
+
+    session_name = session_order{s};
+
+    for e = 1:numel(eyes_order)
+
+        eyes_name = eyes_order{e};
+
+        subset = all_results( ...
+            all_results.Session == string(session_name) & ...
+            all_results.Eyes == string(eyes_name), :);
+
+        if isempty(subset)
+            fprintf('\nNo data for %s %s. Skipping group average.\n', session_name, eyes_name);
+            continue;
+        end
+
+        channels = unique(subset.Channel, 'stable');
+        nChannels = numel(channels);
+
+        Mean_LZc_1 = nan(nChannels, 1);
+        Mean_LZc_5 = nan(nChannels, 1);
+        Mean_LZc_10 = nan(nChannels, 1);
+        Mean_LZc_50 = nan(nChannels, 1);
+        Mean_LZc_100 = nan(nChannels, 1);
+
+        SD_LZc_1 = nan(nChannels, 1);
+        SD_LZc_5 = nan(nChannels, 1);
+        SD_LZc_10 = nan(nChannels, 1);
+        SD_LZc_50 = nan(nChannels, 1);
+        SD_LZc_100 = nan(nChannels, 1);
+
+        n_participants = nan(nChannels, 1);
+
+        for ch = 1:nChannels
+
+            ch_name = channels(ch);
+            ch_subset = subset(subset.Channel == ch_name, :);
+
+            participant_means = groupsummary(ch_subset, 'Participant', 'mean', ...
+                {'LZc_1','LZc_5','LZc_10','LZc_50','LZc_100'});
+
+            Mean_LZc_1(ch)   = mean(participant_means.mean_LZc_1, 'omitnan');
+            Mean_LZc_5(ch)   = mean(participant_means.mean_LZc_5, 'omitnan');
+            Mean_LZc_10(ch)  = mean(participant_means.mean_LZc_10, 'omitnan');
+            Mean_LZc_50(ch)  = mean(participant_means.mean_LZc_50, 'omitnan');
+            Mean_LZc_100(ch) = mean(participant_means.mean_LZc_100, 'omitnan');
+
+            SD_LZc_1(ch)   = std(participant_means.mean_LZc_1, 'omitnan');
+            SD_LZc_5(ch)   = std(participant_means.mean_LZc_5, 'omitnan');
+            SD_LZc_10(ch)  = std(participant_means.mean_LZc_10, 'omitnan');
+            SD_LZc_50(ch)  = std(participant_means.mean_LZc_50, 'omitnan');
+            SD_LZc_100(ch) = std(participant_means.mean_LZc_100, 'omitnan');
+
+            n_participants(ch) = height(participant_means);
+
+        end
+
+        avg_table = table( ...
+            repmat(string(session_name), nChannels, 1), ...
+            repmat(string(eyes_name), nChannels, 1), ...
+            channels, ...
+            Mean_LZc_1, ...
+            Mean_LZc_5, ...
+            Mean_LZc_10, ...
+            Mean_LZc_50, ...
+            Mean_LZc_100, ...
+            SD_LZc_1, ...
+            SD_LZc_5, ...
+            SD_LZc_10, ...
+            SD_LZc_50, ...
+            SD_LZc_100, ...
+            n_participants, ...
+            'VariableNames', {'Session','Eyes','Channel', ...
+            'Mean_LZc_1','Mean_LZc_5','Mean_LZc_10','Mean_LZc_50','Mean_LZc_100', ...
+            'SD_LZc_1','SD_LZc_5','SD_LZc_10','SD_LZc_50','SD_LZc_100', ...
+            'N_Participants'} ...
+        );
+
+        avg_results = [avg_results; avg_table];
+
+        tag = sprintf('GROUP_%s_%s', session_name, eyes_name);
+
+        writetable(avg_table, fullfile(avg_dir, [tag '_average_LZc.csv']));
+
+        avg_plot_values = avg_table.(sprintf('Mean_%s', plot_lzc_column));
+
+        plot_channel_heatmap(avg_plot_values, channels, ...
+            [tag ' Average Channel-wise LZc using ' char(plot_lzc_column)], ...
+            fullfile(avg_dir, [tag '_' char(plot_lzc_column) '_average_channel_heatmap.png']));
+
+        if exist('topoplot', 'file') == 2 && ~isempty(template_chanlocs)
+
+            [aligned_values, aligned_chanlocs] = align_average_to_template( ...
+                avg_table, template_labels, template_chanlocs, sprintf('Mean_%s', plot_lzc_column));
+
+            plot_lzc_topoplot(aligned_values, aligned_chanlocs, ...
+                [tag ' Average LZc Topoplot using ' char(plot_lzc_column)], ...
+                fullfile(avg_dir, [tag '_' char(plot_lzc_column) '_average_topoplot.png']));
+        end
+
+    end
+end
+
+avg_csv = fullfile(avg_dir, 'ALL_GROUP_AVERAGE_LZc.csv');
+writetable(avg_results, avg_csv);
+
+fprintf('\nSaved group averages:\n%s\n', avg_csv);
+
+%% ---------------- COMBINED 2 x 5 GROUP HEATMAP FIGURE ----------------
+
+if ~isempty(avg_results)
+
+    combined_heatmap_path = fullfile(avg_dir, ...
+        ['GROUP_ALL_SESSIONS_2x5_' char(plot_lzc_column) '_channel_heatmaps.png']);
+
+    plot_group_2x5_channel_heatmaps( ...
+        avg_results, ...
+        session_order, ...
+        session_labels, ...
+        eyes_order, ...
+        eyes_labels, ...
+        plot_lzc_column, ...
+        combined_heatmap_path);
+
+    fprintf('\nSaved combined 2x5 channel heatmap figure:\n%s\n', combined_heatmap_path);
+
+end
+
+%% ---------------- COMBINED 2 x 5 GROUP TOPOPLOT FIGURE ----------------
+
+if exist('topoplot', 'file') == 2 && ~isempty(template_chanlocs) && ~isempty(avg_results)
+
+    combined_topoplot_path = fullfile(avg_dir, ...
+        ['GROUP_ALL_SESSIONS_2x5_' char(plot_lzc_column) '_topoplots.png']);
+
+    plot_group_2x5_topoplots( ...
+        avg_results, ...
+        template_labels, ...
+        template_chanlocs, ...
+        session_order, ...
+        session_labels, ...
+        eyes_order, ...
+        eyes_labels, ...
+        plot_lzc_column, ...
+        combined_topoplot_path);
+
+    fprintf('\nSaved combined 2x5 topoplot figure:\n%s\n', combined_topoplot_path);
+
+else
+    fprintf('\nSkipping combined 2x5 topoplot figure: topoplot or template channel locations unavailable.\n');
+end
+
+fprintf('\nAll LZc batch processing complete.\n');
+
