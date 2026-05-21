@@ -93,8 +93,10 @@ for u = 1:length(usr_list)
             fprintf('Performing region-specific peak analysis...\n');
             
             % DLPFC/FPN peak analysis
-            EEG = pop_tesa_peakanalysis(EEG, 'ROI', 'positive', [30], [20 60], 'method', 'largest', 'samples', 5);
-            EEG = pop_tesa_peakanalysis(EEG, 'ROI', 'negative', [30], [20 60], 'method', 'largest', 'samples', 5);
+            EEG = pop_tesa_peakanalysis(EEG, 'ROI', 'positive', [60], [45 75], 'method', 'largest', 'samples', 5, 'tepName', 'P60_analysis');
+
+            % 2. Detect N100 (Negative peak, targeting 100ms, window 80-140ms)
+            EEG = pop_tesa_peakanalysis(EEG, 'ROI', 'negative', [100], [80 140], 'method', 'largest', 'samples', 5, 'tepName', 'N100_analysis');
             
             % Motor cortex peak analysis
             EEG = pop_tesa_peakanalysis(EEG, 'ROI', 'positive', [32 60 180], [26 38; 50 70; 160 200], 'method', 'largest', 'samples', 10);
