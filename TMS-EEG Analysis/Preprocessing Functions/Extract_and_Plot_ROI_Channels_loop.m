@@ -97,14 +97,7 @@ for u = 1:length(usr_list)
 
             % 2. Detect N100 (Negative peak, targeting 100ms, window 80-140ms)
             EEG = pop_tesa_peakanalysis(EEG, 'ROI', 'negative', [100], [80 140], 'method', 'largest', 'samples', 5, 'tepName', 'N100_analysis');
-            
-            % Motor cortex peak analysis
-            EEG = pop_tesa_peakanalysis(EEG, 'ROI', 'positive', [32 60 180], [26 38; 50 70; 160 200], 'method', 'largest', 'samples', 10);
-            EEG = pop_tesa_peakanalysis(EEG, 'ROI', 'negative', [15 50 95], [5 25; 45 55; 85 115], 'method', 'largest', 'samples', 10);
-            
-            % DMN peak analysis
-            EEG = pop_tesa_peakanalysis(EEG, 'ROI', 'positive', [25 180], [15 35; 170 190], 'method', 'largest', 'samples', 5);
-            EEG = pop_tesa_peakanalysis(EEG, 'ROI', 'negative', [55 100], [45 65; 80 130], 'method', 'largest', 'samples', 5);
+          
             
             %% Output peak analysis in tables and plots
             fprintf('Exporting peak analysis outputs...\n');
