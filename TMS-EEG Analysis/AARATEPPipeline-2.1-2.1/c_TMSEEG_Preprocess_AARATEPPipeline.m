@@ -14,6 +14,12 @@ function EEG = c_TMSEEG_Preprocess_AARATEPPipeline(varargin)
 %   'outputFilePrefix': string to include as a prefix in every output filename
 %   'artifactTimespan': timespan, in seconds, within which to replace data with interpolated values
 %   'baselineTimespan': timespan, in seconds, to use for per-epoch baseline subtraction
+%   'doEarlyArtifactInterpolation': whether to interpolate the artifact timespan before early processing
+%   'doPostICAArtifactInterpolation': whether to interpolate the artifact timespan after ICA cleanup
+%   'doBaselineCorrection': whether to apply baseline subtraction after downsampling
+%   'doHighPassFiltering': whether to apply the high-pass filtering stage
+%   'doBasicChannelRejection': whether to run the early bad-channel detection stage
+%   'doInitialEyeBlinkRemoval': whether to run the initial eye-blink ICA rejection stage
 %   'downsampleTo': frequency, in Hz, to downsample to before most preprocessing stages. Note that
 %                    it is critical to pass in data before downsampling to do some artifact 
 %                    interpolation prior to this downsampling stage.
@@ -26,9 +32,14 @@ function EEG = c_TMSEEG_Preprocess_AARATEPPipeline(varargin)
 %						rejection stage. Set to 1 or greater to skip early eye IC rejection stage.
 %   'leadFieldPath': path to lead field file or lead field matrix itself to be used by SOUND. If 
 %                     empty, SOUND will use a template lead field
+%   'doDecayRemoval': whether to perform decay artifact fitting/removal stage
 %   'doDecayRemovalPerTrial': whether to do decay fitting and removal partially on a per-trial basis
 %                              (true) or to subtract the exact same decay timecourse from every 
 %                              trial (false)
+%   'postNotchCleanupMethod': method to run after notch filtering. One of {'ICA','SSPSIR','BOTH'}
+%   'doSSPSIRBeforeICA': legacy flag, retained for backward compatibility
+%   'SSPSIRTimeRange': time range, in ms, used by SSP-SIR for artifact PCA (e.g. [0 20])
+%   'SSPSIRPC': SSP-SIR PC setting. Can be a scalar (fixed number of PCs) or e.g. {'data', 90}
 %   'ICAType': string, method of ICA to be used, as referenced in c_EEG_ICA
 %   'stimMuscleComponentThreshold': scalar, threshold over which to classify ICs as TMS-induced 
 %                                    muscle artifact
@@ -63,8 +74,13 @@ p.addParameter('pulseEvents', '', @(x) ischar(x) || iscellstr(x));
 p.addParameter('outputDir', '', @ischar);
 p.addParameter('outputFilePrefix', 'PreprocessedResults', @ischar);
 p.addParameter('epochTimespan', [], @c_isSpan);
-p.addParameter('artifactTimespan', [-0.002, 0.007], @c_isSpan); %Upper bound was originally 12 ms
+p.addParameter('artifactTimespan', [-0.002, 0.009], @c_isSpan); %Upper bound was originally 12 ms
 p.addParameter('baselineTimespan', [-0.5 -0.01], @c_isSpan);
+p.addParameter('doEarlyArtifactInterpolation', true, @islogical);
+p.addParameter('doBaselineCorrection', true, @islogical);
+p.addParameter('doHighPassFiltering', true, @islogical);
+p.addParameter('doBasicChannelRejection', true, @islogical);
+p.addParameter('doInitialEyeBlinkRemoval', true, @islogical);
 p.addParameter('filterPrePostExtrapolationDurations', [0 0], @(x) isnumeric(x) && length(x)==2);
 p.addParameter('downsampleTo', 1000, @isscalar);
 p.addParameter('bandpassFreqSpan', [1 200], @c_isSpan);
@@ -73,9 +89,14 @@ p.addParameter('badChannelThreshold', 10, @isscalar);
 p.addParameter('initialEyeComponentThreshold', 0.9, @isscalar);
 p.addParameter('SOUNDlambda', 10^-1.5, @isscalar);
 p.addParameter('leadFieldPath', '', @(x) ischar(x) || ismatrix(x));  % used by SOUND
+p.addParameter('doDecayRemoval', true, @islogical);
 p.addParameter('doDecayRemovalPerTrial', true, @islogical);
 p.addParameter('lineNoiseFreq', 60, @isscalar);  % in Hz
 p.addParameter('lineNoiseNumHarmonics', 1, @isscalar);
+p.addParameter('postNotchCleanupMethod', 'ICA', @(x) ischar(x) || isstring(x));
+p.addParameter('doSSPSIRBeforeICA', true, @islogical);
+p.addParameter('SSPSIRTimeRange', [0 20], @(x) isnumeric(x) && length(x)==2);
+p.addParameter('SSPSIRPC', {'data', 90}, @(x) isnumeric(x) || iscell(x));
 p.addParameter('ICAType', 'fastica', @ischar);
 p.addParameter('brainComponentThreshold', 0.3, @isscalar);
 p.addParameter('stimMuscleComponentThreshold', 8, @isscalar);
@@ -91,8 +112,22 @@ p.parse(varargin{:});
 s = p.Results;
 EEG = s.EEG;
 
+s.postNotchCleanupMethod = upper(strtrim(char(s.postNotchCleanupMethod)));
+if strcmp(s.postNotchCleanupMethod, 'SSPSIR+ICA') || strcmp(s.postNotchCleanupMethod, 'SSPSIR_ICA') || strcmp(s.postNotchCleanupMethod, 'SSPSIRANDICA') || strcmp(s.postNotchCleanupMethod, 'BOTH')
+	s.postNotchCleanupMethod = 'BOTH';
+end
+if ~ismember(s.postNotchCleanupMethod, {'ICA', 'SSPSIR', 'BOTH'})
+	error('postNotchCleanupMethod must be one of {''ICA'',''SSPSIR'',''BOTH''}');
+end
+
+% Backward compatibility with legacy flag if new parameter was not explicitly passed.
+if ismember('postNotchCleanupMethod', p.UsingDefaults) && s.doSSPSIRBeforeICA
+	s.postNotchCleanupMethod = 'SSPSIR';
+end
+
 md = struct();
 md.pipelineVersion = '2.1.1';
+md.postNotchCleanupMethod = s.postNotchCleanupMethod;
 
 % check for required named arguments
 assert(~isempty(s.pulseEvents), 'Pulse event(s) must be specified');
@@ -150,17 +185,16 @@ c_sayDone('Extracted %d epochs', EEG.trials);
 %     end
 
 %% interpolate artifact timespan
-c_say('Interpolating artifact timespan');
-EEG = c_EEG_ReplaceEpochTimeSegment(EEG,...
-	'timespanToReplace', s.artifactTimespan,...
-	'method', 'ARExtrapolation',...
-	'prePostFitDurations', [20 20]*1e-3);
-c_sayDone();
-
-%     if s.doDebug
-%         intermediateEEGs{end+1} = EEG;
-%         intermediateLabels{end+1} = 'Artifact interpolated';
-%     end
+if s.doEarlyArtifactInterpolation
+	c_say('Interpolating artifact timespan');
+	EEG = c_EEG_ReplaceEpochTimeSegment(EEG,...
+		'timespanToReplace', s.artifactTimespan,...
+		'method', 'ARExtrapolation',...
+		'prePostFitDurations', [20 20]*1e-3);
+	c_sayDone();
+else
+	c_saySingle('Skipping artifact interpolation stage.');
+end
 
 %% downsample
 if EEG.srate > s.downsampleTo
@@ -175,71 +209,89 @@ if EEG.srate > s.downsampleTo
 end
 
 %% baseline correct
-baselineTimespan = s.baselineTimespan;
-baselineTimespan(2) = min(baselineTimespan(2), s.artifactTimespan(1));
-tIndices = EEG.times >= baselineTimespan(1)*1e3 & EEG.times < baselineTimespan(2)*1e3;
-toSubtract = nanmean(EEG.data(:, tIndices, :), 2);
-EEG.data = EEG.data - toSubtract;
+if s.doBaselineCorrection
+	baselineTimespan = s.baselineTimespan;
+	baselineTimespan(2) = min(baselineTimespan(2), s.artifactTimespan(1));
+	tIndices = EEG.times >= baselineTimespan(1)*1e3 & EEG.times < baselineTimespan(2)*1e3;
+	toSubtract = nanmean(EEG.data(:, tIndices, :), 2);
+	EEG.data = EEG.data - toSubtract;
 
-if s.doDebug
-	intermediateEEGs{end+1} = EEG;
-	intermediateLabels{end+1} = 'Baseline subtracted';
+	if s.doDebug
+		intermediateEEGs{end+1} = EEG;
+		intermediateLabels{end+1} = 'Baseline subtracted';
+	end
+else
+	c_saySingle('Skipping baseline correction stage.');
 end
 
 %% High-pass filtering
-c_say('Highpass filtering')
-timeToExtend = 0.5;
-maxTimeToExtend = min(abs(s.epochTimespan - s.artifactTimespan*3));
-timeToExtend = min(timeToExtend, maxTimeToExtend);
-EEG = c_TMSEEG_applyModifiedBandpassFilter(EEG,...
-	'piecewiseTimeToExtend', timeToExtend,...
-	'lowCutoff', s.bandpassFreqSpan(1),...
-	'artifactTimespan', s.artifactTimespan*3,...
-	'prePostExtrapolationDurations', s.filterPrePostExtrapolationDurations);
-c_sayDone();
-if s.doDebug
-	intermediateEEGs{end+1} = EEG;
-	intermediateLabels{end+1} = 'High-pass filtered';
+if s.doHighPassFiltering
+	c_say('Highpass filtering')
+	timeToExtend = 0.5;
+	maxTimeToExtend = min(abs(s.epochTimespan - s.artifactTimespan*3));
+	timeToExtend = min(timeToExtend, maxTimeToExtend);
+	EEG = c_TMSEEG_applyModifiedBandpassFilter(EEG,...
+		'piecewiseTimeToExtend', timeToExtend,...
+		'lowCutoff', s.bandpassFreqSpan(1),...
+		'artifactTimespan', s.artifactTimespan*3,...
+		'prePostExtrapolationDurations', s.filterPrePostExtrapolationDurations);
+	c_sayDone();
+	if s.doDebug
+		intermediateEEGs{end+1} = EEG;
+		intermediateLabels{end+1} = 'High-pass filtered';
+	end
+else
+	c_saySingle('Skipping high-pass filtering stage.');
 end
 
 %% basic channel rejection
-doReplaceBadChanImmediately = true;
+if s.doBasicChannelRejection
+	doReplaceBadChanImmediately = true;
 
-[EEG, misc] = c_TMSEEG_detectBadChannels(EEG,...
-	'detectionMethod', s.badChannelDetectionMethod,...
-	'artifactTimespan', s.artifactTimespan*2,...
-	'threshold', s.badChannelThreshold,...
-	'replaceMethod', c_if(doReplaceBadChanImmediately, 'interpolate', 'none'),...
-	'doPlot', true);
+	[EEG, misc] = c_TMSEEG_detectBadChannels(EEG,...
+		'detectionMethod', s.badChannelDetectionMethod,...
+		'artifactTimespan', s.artifactTimespan*2,...
+		'threshold', s.badChannelThreshold,...
+		'replaceMethod', c_if(doReplaceBadChanImmediately, 'interpolate', 'none'),...
+		'doPlot', true);
 
-badChannels = misc.badChannelIndices;
+	badChannels = misc.badChannelIndices;
+	rejectedChannelsLegend = getRejectedChannelsLegendText(EEG, badChannels);
+	addRejectedChannelsTextNote(misc.hf, rejectedChannelsLegend, 'center');
+	figure(misc.hf);
+	drawnow;
 
-c_FigurePrinter.copyToFile(fullfile(s.outputDir, [s.outputFilePrefix '_QC_EarlyChannelRejection.png']),...
-	'magnification', 2, 'doTransparent', false);
-close(misc.hf);
+	c_FigurePrinter.copyToFile(fullfile(s.outputDir, [s.outputFilePrefix '_QC_EarlyChannelRejection.png']),...
+		'magnification', 2, 'resolution', 450, 'doTransparent', false, 'hf', misc.hf);
+	close(misc.hf);
 
-md.earlyRejectedChannels = badChannels;
+	md.earlyRejectedChannels = badChannels;
 
-if s.doDebug
-	if ~isempty(badChannels)
-		if doReplaceBadChanImmediately
-			intermediateEEGs{end+1} = EEG;
+	if s.doDebug
+		if ~isempty(badChannels)
+			if doReplaceBadChanImmediately
+				intermediateEEGs{end+1} = EEG;
+			else
+				intermediateEEGs{end+1} = pop_select(EEG, 'nochannel', badChannels);
+			end
+			intermediateLabels{end+1} = 'After channel rejection';
 		else
-			intermediateEEGs{end+1} = pop_select(EEG, 'nochannel', badChannels);
+			intermediateEEGs{end+1} = EEG;
+			intermediateLabels{end+1} = '(After channel rejection)';
 		end
-		intermediateLabels{end+1} = 'After channel rejection';
-	else
-		intermediateEEGs{end+1} = EEG;
-		intermediateLabels{end+1} = '(After channel rejection)';
+		tmpEEG = [];
 	end
-	tmpEEG = [];
+else
+	c_saySingle('Skipping basic channel rejection stage.');
+	badChannels = [];
+	md.earlyRejectedChannels = badChannels;
 end
 
 %% Initial eye-blink removal
 % Note: do this prior to SOUND, since SOUND tends to make eye blink topographies look more "brain-like" in a way
 %  that makes them more difficult to reject later.
 
-if s.initialEyeComponentThreshold < 1
+if s.doInitialEyeBlinkRemoval && s.initialEyeComponentThreshold < 1
 	c_say('Rereferencing');
 	EEG = pop_reref(EEG, []);
 	c_sayDone();
@@ -262,11 +314,19 @@ if s.initialEyeComponentThreshold < 1
 	md.eyeICA_numRejComp = sum(misc.rejectComponents);
 
 	if true
-		figure(misc.hf);
+		if isfield(misc, 'hf') && ~isempty(misc.hf) && isgraphics(misc.hf, 'figure')
+			hf = misc.hf;
+		else
+			hf = figure;
+			misc.hf = hf;
+		end
+		figure(hf);
+		adjustICAComponentFigureLayout(hf);
 		c_FigurePrinter.copyToFile(fullfile(s.outputDir, [s.outputFilePrefix, '_QC_EyeICA_ClassifiedComponents.png']),...
 			'magnification', 2,...
+			'resolution', 350,...
 			'doTransparent', false);
-		close(misc.hf);
+		close(hf);
 	end
 
 	if  md.eyeICA_numRejComp > 0
@@ -296,6 +356,8 @@ if s.initialEyeComponentThreshold < 1
 	end
 else
 	c_saySingle('Skipping early eye component rejection stage.')
+	md.eyeICA_numComp = 0;
+	md.eyeICA_numRejComp = 0;
 end
 
 
@@ -331,30 +393,60 @@ if true
 end
 
 %% decay fitting and removal
-[EEG, misc] = c_TMSEEG_fitAndRemoveDecayArtifact(EEG,...
-	'artifactTimespan', s.artifactTimespan,...
-	'trialAggMethod_timeCourseRemoval', c_if(s.doDecayRemovalPerTrial, 'none', 'mean'),...
-	'aggTrimPercent', 10,...
-	'doPlot', true);
+if s.doDecayRemoval
+	[EEG, misc] = c_TMSEEG_fitAndRemoveDecayArtifact(EEG,...
+		'artifactTimespan', s.artifactTimespan,...
+		'trialAggMethod_timeCourseRemoval', c_if(s.doDecayRemovalPerTrial, 'none', 'mean'),...
+		'aggTrimPercent', 10,...
+		'doPlot', true);
 
-figure(misc.hf);
-c_FigurePrinter.copyToFile(fullfile(s.outputDir, [s.outputFilePrefix '_QC_DecayFitAndRemoval.png']), 'magnification', 2, 'doTransparent', false);
-close(misc.hf);
+	figure(misc.hf);
 
-md.didRemoveDecay = misc.didRemoveDecay;
+	% Make the decay-fit line plot text a bit smaller for readability.
+	allAxes = findall(misc.hf, 'type', 'axes');
+	if ~isempty(allAxes)
+		set(allAxes, 'FontSize', 10, 'TitleFontSizeMultiplier', 0.9, 'LabelFontSizeMultiplier', 0.9);
+	end
+	allText = findall(misc.hf, 'type', 'text');
+	if ~isempty(allText)
+		set(allText, 'FontSize', 10);
+	end
+	allLegends = findall(misc.hf, 'type', 'legend');
+	if ~isempty(allLegends)
+		set(allLegends, 'FontSize', 10);
+	end
 
-if s.doDebug
-	intermediateEEGs{end+1} = EEG;
-	intermediateLabels{end+1} = 'After decay removal';
+	drawnow;
+	c_FigurePrinter.copyToFile(fullfile(s.outputDir, [s.outputFilePrefix '_QC_DecayFitAndRemoval.png']), 'magnification', 2, 'resolution', 450, 'doTransparent', false);
+	close(misc.hf);
+
+	md.didRemoveDecay = misc.didRemoveDecay;
+
+	if s.doDebug
+		intermediateEEGs{end+1} = EEG;
+		intermediateLabels{end+1} = 'After decay removal';
+	end
+else
+	c_saySingle('Skipping decay fitting/removal stage.');
+	md.didRemoveDecay = false;
+
+	if s.doDebug
+		intermediateEEGs{end+1} = EEG;
+		intermediateLabels{end+1} = '(Decay removal skipped)';
+	end
 end
 
 %% interpolate artifact timespan (to remove any large decay residuals in artifactTimespan)
-c_say('Interpolating artifact timespan');
-EEG = c_EEG_ReplaceEpochTimeSegment(EEG,...
-	'timespanToReplace', s.artifactTimespan,...
-	'method', 'ARExtrapolation',...
-	'prePostFitDurations', [20 20]*1e-3);
-c_sayDone();
+if s.doPostICAArtifactInterpolation
+	c_say('Interpolating artifact timespan');
+	EEG = c_EEG_ReplaceEpochTimeSegment(EEG,...
+		'timespanToReplace', s.artifactTimespan,...
+		'method', 'ARExtrapolation',...
+		'prePostFitDurations', [20 20]*1e-3);
+	c_sayDone();
+else
+	c_saySingle('Skipping artifact interpolation stage.');
+end
 
 if s.doDebug
 	intermediateEEGs{end+1} = EEG;
@@ -377,104 +469,294 @@ else
 end
 c_sayDone();
 
-%% ICA
-c_say('Running ICA');
-EEG = c_EEG_ICA(EEG, 'method', s.ICAType);
-c_sayDone();
+%% SSP-SIR (TESA)
+if strcmp(s.postNotchCleanupMethod, 'SSPSIR') || strcmp(s.postNotchCleanupMethod, 'BOTH')
+	assert(exist('pop_tesa_sspsir', 'file') == 2,...
+		'TESA function pop_tesa_sspsir was not found on the MATLAB path');
 
-c_say('Labeling ICs using ICLabel');
-[EEG, misc] = c_TMSEEG_runICLabel(EEG,...
-	'brainComponentThreshold', s.brainComponentThreshold,...
-    'doPlot', true,...
-    'doRejection', false);
-c_sayDone();
-
-% EEG.reject.gcompreject should have been set to rejectComponents inside c_TMSEEG_runICLabel
-
-if s.doDebug
-    tmpEEG = pop_subcomp(EEG,find(misc.rejectComponents));
-    intermediateEEGs{end+1} = tmpEEG;
-    intermediateLabels{end+1} = 'After ICA + ICLabel';
-end
-
-% inspired by tesa_compselect, classify as TMS-evoked muscle if very localized to short latency response
-tmsMuscleWinTimespan = [11 30]*1e-3; % in s
-icaact = eeg_getica(EEG);
-numComps = size(EEG.icaweights, 1);
-tmsMuscleRatio = nan(numComps, 1);
-for iC = 1:numComps
-    indicesInWin = EEG.times >= tmsMuscleWinTimespan(1)*1e3 & EEG.times < tmsMuscleWinTimespan(2)*1e3;
-    assert(any(indicesInWin));
-    muscleScore = abs(mean(icaact(iC, :, :), 3));
-    winScore = mean(muscleScore(:, indicesInWin), 2);
-    tmsMuscleRatio(iC) = winScore / mean(muscleScore);
-end
-toRejectForMuscle = tmsMuscleRatio > s.stimMuscleComponentThreshold;
-
-numNewRejected = sum(~misc.rejectComponents & toRejectForMuscle);
-if numNewRejected > 0
-    c_saySingle('Marked %d additional components for rejection as TMS-induced muscle artifacts');
-    misc.rejectComponents = misc.rejectComponents | toRejectForMuscle;
-    EEG.reject.gcompreject = misc.rejectComponents;
-    didRejectExtra = true;
-    
-    % re-plot components after changing rejection labels
-    close(misc.hf);
-    pop_viewprops(EEG, 0, 1:size(EEG.icawinv, 2), {}, {}, 0, 'ICLabel');
-    misc.hf = gcf;
-else
-    didRejectExtra = false;
-end
-
-if sum(~misc.rejectComponents) < 4
-    % very small number of components remain after rejection
-	msg = sprintf('Only %d/%d components remain after rejection', sum(~misc.rejectComponents), length(misc.rejectComponents));
-    switch(s.onOverRejection)
-		case 'error'
-			error('%s', msg);
-		case 'warn'
-			warning('%s', msg);
-		case 'pause'
-			c_say('%s. Pausing', msg);
-			keyboard
-			c_sayDone();
-		otherwise
-			error('Not implemented');
+	if true
+		% save EEG prior to SSP-SIR for alternate cleanup analyses
+		outputPath = fullfile(s.outputDir, [s.outputFilePrefix '_preSSPSIR.mat']);
+		c_say('Prior to SSP-SIR, saving results to %s', outputPath);
+		c_save(outputPath, 'EEG', 'md');
+		c_sayDone();
 	end
+
+	EEG_beforeSSPSIR = EEG;
+	allFigsBeforeSSPSIR = findall(0, 'type', 'figure');
+
+	c_say('Running SSP-SIR');
+	EEG = pop_tesa_sspsir(EEG,...
+		'artScale', 'manual',...
+		'timeRange', s.SSPSIRTimeRange,...
+		'PC', s.SSPSIRPC);
+	c_sayDone();
+
+	drawnow;
+	allFigsAfterSSPSIR = findall(0, 'type', 'figure');
+	newSSPSIRFigs = setdiff(allFigsAfterSSPSIR, allFigsBeforeSSPSIR);
+	for iFig = 1:length(newSSPSIRFigs)
+		if isgraphics(newSSPSIRFigs(iFig), 'figure')
+			close(newSSPSIRFigs(iFig));
+		end
+	end
+
+	hf = figure;
+	set(hf, 'Position', [50 50 1700 1100]);
+	ht = tiledlayout(2, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
+	title(ht, 'SSP-SIR QC: all-channel averages + GMFA before vs after');
+
+	beforeMean = squeeze(mean(EEG_beforeSSPSIR.data, 3));
+	afterMean = squeeze(mean(EEG.data, 3));
+	numCh = size(beforeMean, 1);
+	gmfaBefore = sqrt(mean((beforeMean - mean(beforeMean, 1)).^2, 1));
+	gmfaAfter = sqrt(mean((afterMean - mean(afterMean, 1)).^2, 1));
+
+	xCoords = nan(numCh, 1);
+	yCoords = nan(numCh, 1);
+	for iCh = 1:numCh
+		if iCh <= length(EEG.chanlocs) && isfield(EEG.chanlocs, 'X') && isfield(EEG.chanlocs, 'Y') && ...
+				~isempty(EEG.chanlocs(iCh).X) && ~isempty(EEG.chanlocs(iCh).Y)
+			xCoords(iCh) = EEG.chanlocs(iCh).X;
+			yCoords(iCh) = EEG.chanlocs(iCh).Y;
+		end
+	end
+
+	if any(isnan(xCoords) | isnan(yCoords))
+		for iCh = 1:numCh
+			if iCh <= length(EEG.chanlocs) && isfield(EEG.chanlocs, 'theta') && isfield(EEG.chanlocs, 'radius') && ...
+					~isempty(EEG.chanlocs(iCh).theta) && ~isempty(EEG.chanlocs(iCh).radius)
+				% EEGLab convention: x = sin(theta)*radius (left-right), y = cos(theta)*radius (front-back)
+				xCoords(iCh) = EEG.chanlocs(iCh).radius * sin(EEG.chanlocs(iCh).theta * pi/180);
+				yCoords(iCh) = EEG.chanlocs(iCh).radius * cos(EEG.chanlocs(iCh).theta * pi/180);
+			end
+		end
+	end
+
+	if any(isnan(xCoords) | isnan(yCoords))
+		tmpTheta = linspace(0, 2*pi, numCh+1);
+		tmpTheta = tmpTheta(1:end-1);
+		xCoords = 0.48*cos(tmpTheta(:));
+		yCoords = 0.48*sin(tmpTheta(:));
+	else
+		r = sqrt(xCoords.^2 + yCoords.^2);
+		rMax = max(r);
+		if rMax > 0
+			xCoords = xCoords / rMax * 0.18;
+			yCoords = yCoords / rMax * 0.18;
+		end
+	end
+
+	channelColors = zeros(numCh, 3);
+	xMin = min(xCoords);
+	xMax = max(xCoords);
+	if xMax > xMin
+		xNorm = (xCoords - xMin) / (xMax - xMin);
+	else
+		xNorm = 0.5*ones(numCh, 1);
+	end
+	yMin = min(yCoords);
+	yMax = max(yCoords);
+	if yMax > yMin
+		yNorm = (yCoords - yMin) / (yMax - yMin);
+	else
+		yNorm = 0.5*ones(numCh, 1);
+	end
+	for iCh = 1:numCh
+		t = xNorm(iCh);
+		if t < 0.5
+			u = t / 0.5;
+			baseColor = [0, u, 1-u]; % blue -> green
+		else
+			u = (t - 0.5) / 0.5;
+			baseColor = [u, 1-u, 0]; % green -> red
+		end
+		shadeScale = 1 - 0.35*(1 - yNorm(iCh)); % darker front (high yNorm = front), lighter back
+		channelColors(iCh, :) = max(0, min(1, baseColor * shadeScale));
+	end
+
+	axBefore = nexttile(1);
+	hold(axBefore, 'on');
+	for iCh = 1:numCh
+		plot(axBefore, EEG_beforeSSPSIR.times, beforeMean(iCh, :), 'LineWidth', 0.6, 'Color', channelColors(iCh, :));
+	end
+	hGMFABefore = plot(axBefore, EEG_beforeSSPSIR.times, gmfaBefore, 'k', 'LineWidth', 2.2);
+	xline(axBefore, 0, 'k--');
+	xlabel('Time (ms)');
+	ylabel('Amplitude (\muV)');
+	title(sprintf('Before SSP-SIR (%d channels)', numCh));
+	grid on;
+
+	axAfter = nexttile(2);
+	hold(axAfter, 'on');
+	for iCh = 1:numCh
+		plot(axAfter, EEG.times, afterMean(iCh, :), 'LineWidth', 0.6, 'Color', channelColors(iCh, :));
+	end
+	hGMFAAfter = plot(axAfter, EEG.times, gmfaAfter, 'k', 'LineWidth', 2.2);
+	xline(axAfter, 0, 'k--');
+	xlabel('Time (ms)');
+	ylabel('Amplitude (\muV)');
+	title(sprintf('After SSP-SIR (%d channels)', numCh));
+	grid on;
+
+	linkaxes([axBefore axAfter], 'xy');
+	xlim(axBefore, [EEG.times(1) EEG.times(end)]);
+	xlim(axAfter, [EEG.times(1) EEG.times(end)]);
+
+	maxAbsY = max(abs([beforeMean(:); afterMean(:); gmfaBefore(:); gmfaAfter(:)]));
+	if ~isfinite(maxAbsY) || maxAbsY <= 0
+		maxAbsY = 1;
+	end
+	maxAbsY = ceil(maxAbsY / 2) * 2;
+	yLimCommon = [-1 1] * maxAbsY;
+	yTicksCommon = yLimCommon(1):2:yLimCommon(2);
+	set(axBefore, 'YLim', yLimCommon, 'YTick', yTicksCommon);
+	set(axAfter, 'YLim', yLimCommon, 'YTick', yTicksCommon);
+
+	legend(axBefore, hGMFABefore, {'GMFA'}, 'Location', 'northwest');
+	legend(axAfter, hGMFAAfter, {'GMFA'}, 'Location', 'northwest');
+
+	drawnow;
+	addSSPSIRInsetTopoplot(hf, axBefore, xCoords, yCoords, channelColors);
+	addSSPSIRInsetTopoplot(hf, axAfter, xCoords, yCoords, channelColors);
+
+	c_FigurePrinter.copyToFile(fullfile(s.outputDir, [s.outputFilePrefix '_QC_SSPSIR.png']),...
+		'magnification', 2,...
+		'resolution', 350,...
+		'doTransparent', false);
+	close(hf);
+
+	md.didRunSSPSIR = true;
+	md.didRunSecondICA = false;
+	md.SSPSIR_timeRange = s.SSPSIRTimeRange;
+	md.SSPSIR_PC = s.SSPSIRPC;
+
+	if s.doDebug
+		intermediateEEGs{end+1} = EEG;
+		intermediateLabels{end+1} = 'After SSP-SIR';
+	end
+else
+	md.didRunSSPSIR = false;
 end
 
-md.ICA_numComp = length(misc.rejectComponents);
-md.ICA_numRejComp = sum(misc.rejectComponents);
+%% ICA
+if strcmp(s.postNotchCleanupMethod, 'ICA') || strcmp(s.postNotchCleanupMethod, 'BOTH')
+	md.didRunSecondICA = true;
 
-if true
-    % save EEG prior to component rejection to allow different component rejection choices later
-    outputPath = fullfile(s.outputDir, [s.outputFilePrefix '_preICARejection.mat']);
-    c_say('Prior to ICA rejection, saving results to %s', outputPath);
-    c_save(outputPath, 'EEG', 'md');
-    c_sayDone();
-end
+	c_say('Running ICA');
+	EEG = c_EEG_ICA(EEG, 'method', s.ICAType);
+	c_sayDone();
 
-if true
-    figure(misc.hf);
-    c_FigurePrinter.copyToFile(fullfile(s.outputDir, [s.outputFilePrefix '_QC_ClassifiedComponents.png']), 'magnification', 2, 'doTransparent', false);
-    close(misc.hf);
-end
+	c_say('Labeling ICs using ICLabel');
+	[EEG, misc] = c_TMSEEG_runICLabel(EEG,...
+		'brainComponentThreshold', s.brainComponentThreshold,...
+		'doPlot', true,...
+		'doRejection', false);
+	c_sayDone();
 
-c_say('Rejecting %d/%d components', md.ICA_numRejComp, md.ICA_numComp);
-EEG = pop_subcomp(EEG,find(misc.rejectComponents));
-c_sayDone();
+	% EEG.reject.gcompreject should have been set to rejectComponents inside c_TMSEEG_runICLabel
 
-if s.doDebug
-    intermediateEEGs{end+1} = EEG;
-    if didRejectExtra
-        intermediateLabels{end+1} = 'After ICA + ICLabel + Extra';
-    else
-        intermediateLabels{end+1} = 'After ICA + ICLabel (+ Extra)';
-    end
+	if s.doDebug
+		tmpEEG = pop_subcomp(EEG,find(misc.rejectComponents));
+		intermediateEEGs{end+1} = tmpEEG;
+		intermediateLabels{end+1} = 'After ICA + ICLabel';
+	end
+
+	% inspired by tesa_compselect, classify as TMS-evoked muscle if very localized to short latency response
+	tmsMuscleWinTimespan = [11 30]*1e-3; % in s
+	icaact = eeg_getica(EEG);
+	numComps = size(EEG.icaweights, 1);
+	tmsMuscleRatio = nan(numComps, 1);
+	for iC = 1:numComps
+		indicesInWin = EEG.times >= tmsMuscleWinTimespan(1)*1e3 & EEG.times < tmsMuscleWinTimespan(2)*1e3;
+		assert(any(indicesInWin));
+		muscleScore = abs(mean(icaact(iC, :, :), 3));
+		winScore = mean(muscleScore(:, indicesInWin), 2);
+		tmsMuscleRatio(iC) = winScore / mean(muscleScore);
+	end
+	toRejectForMuscle = tmsMuscleRatio > s.stimMuscleComponentThreshold;
+
+	numNewRejected = sum(~misc.rejectComponents & toRejectForMuscle);
+	if numNewRejected > 0
+		c_saySingle('Marked %d additional components for rejection as TMS-induced muscle artifacts');
+		misc.rejectComponents = misc.rejectComponents | toRejectForMuscle;
+		EEG.reject.gcompreject = misc.rejectComponents;
+		didRejectExtra = true;
+		
+		% re-plot components after changing rejection labels
+		if isfield(misc, 'hf') && ~isempty(misc.hf) && isgraphics(misc.hf, 'figure')
+			close(misc.hf);
+		end
+		pop_viewprops(EEG, 0, 1:size(EEG.icawinv, 2), {}, {}, 0, 'ICLabel');
+		misc.hf = gcf;
+		if isgraphics(misc.hf, 'figure')
+			adjustICAComponentFigureLayout(misc.hf);
+		end
+	else
+		didRejectExtra = false;
+	end
+
+	if sum(~misc.rejectComponents) < 4
+		% very small number of components remain after rejection
+		msg = sprintf('Only %d/%d components remain after rejection', sum(~misc.rejectComponents), length(misc.rejectComponents));
+		switch(s.onOverRejection)
+			case 'error'
+				error('%s', msg);
+			case 'warn'
+				warning('%s', msg);
+			case 'pause'
+				c_say('%s. Pausing', msg);
+				keyboard
+				c_sayDone();
+			otherwise
+				error('Not implemented');
+		end
+	end
+
+	md.ICA_numComp = length(misc.rejectComponents);
+	md.ICA_numRejComp = sum(misc.rejectComponents);
+
+	if true
+		% save EEG prior to component rejection to allow different component rejection choices later
+		outputPath = fullfile(s.outputDir, [s.outputFilePrefix '_preICARejection.mat']);
+		c_say('Prior to ICA rejection, saving results to %s', outputPath);
+		c_save(outputPath, 'EEG', 'md');
+		c_sayDone();
+	end
+
+	if true
+		if isfield(misc, 'hf') && ~isempty(misc.hf) && isgraphics(misc.hf, 'figure')
+			hf = misc.hf;
+		else
+			hf = figure;
+			misc.hf = hf;
+		end
+		figure(hf);
+		adjustICAComponentFigureLayout(hf);
+		c_FigurePrinter.copyToFile(fullfile(s.outputDir, [s.outputFilePrefix '_QC_ClassifiedComponents.png']), 'magnification', 2, 'resolution', 350, 'doTransparent', false);
+		close(hf);
+	end
+
+	c_say('Rejecting %d/%d components', md.ICA_numRejComp, md.ICA_numComp);
+	EEG = pop_subcomp(EEG,find(misc.rejectComponents));
+	c_sayDone();
+
+	if s.doDebug
+		intermediateEEGs{end+1} = EEG;
+		if didRejectExtra
+			intermediateLabels{end+1} = 'After ICA + ICLabel + Extra';
+		else
+			intermediateLabels{end+1} = 'After ICA + ICLabel (+ Extra)';
+		end
+	end
+else
+	md.didRunSecondICA = false;
+	md.ICA_numComp = nan;
+	md.ICA_numRejComp = nan;
 end
 
 %% interpolate again
-if s.doPostICAArtifactInterpolation
+if s.doPostICAArtifactInterpolation && (strcmp(s.postNotchCleanupMethod, 'ICA') || strcmp(s.postNotchCleanupMethod, 'BOTH'))
 	c_say('Interpolating artifact timespan');
 	EEG = c_EEG_ReplaceEpochTimeSegment(EEG,...
 		'timespanToReplace', s.artifactTimespan,...
@@ -513,17 +795,54 @@ c_sayDone();
 if s.doPlotFinalTimtopo
 	c_say('Plotting final timtopo');
 	outputPath = fullfile(s.outputDir, [s.outputFilePrefix '_Plot_TEPTimtopo.png']);
+	rejectedChannelsLegend = getRejectedChannelsLegendText(EEG, badChannels);
 	hf = figure;
 	tmp = c_EEG_plotTimtopo(EEG,...
 		'doShowColorbars', false,... 
 		'doPlotGMFA', true,...
 		'TPOI', s.plotTPOIs,...
 		'xlim', s.plotXLim*1e3);
-	hf.Position = [50 50 600 400];
+	hf = gcf;
+	hf.Position = [50 50 1800 1200];
+	set(hf, 'PaperPositionMode', 'manual', 'PaperUnits', 'inches', 'PaperPosition', [0 0 18 12]);
+	allAxes = findall(hf, 'type', 'axes');
+	if ~isempty(allAxes)
+		set(allAxes, 'FontSize', 18, 'TitleFontSizeMultiplier', 1.3, 'LabelFontSizeMultiplier', 1.3);
+		for iAx = 1:numel(allAxes)
+			t = get(allAxes(iAx), 'Title');
+			if isgraphics(t, 'text')
+				set(t, 'FontSize', 24);
+			end
+		end
+	end
+	allText = findall(hf, 'type', 'text');
+	if ~isempty(allText)
+		allTitleText = gobjects(0);
+		for iAx = 1:numel(allAxes)
+			t = get(allAxes(iAx), 'Title');
+			if isgraphics(t, 'text')
+				allTitleText(end+1) = t;
+			end
+		end
+		allText = setdiff(allText, allTitleText);
+		if ~isempty(allText)
+			set(allText, 'FontSize', 18);
+		end
+	end
+	allLegends = findall(hf, 'type', 'legend');
+	if ~isempty(allLegends)
+		set(allLegends, 'FontSize', 18);
+	end
+	shiftFigureAxesLeftForTimtopo(hf, 0.03);
+	addRejectedChannelsTextNote(hf, rejectedChannelsLegend, 'left');
+	figure(hf);
+	drawnow;
 	c_FigurePrinter.copyToFile(outputPath,...
-		'doCrop', true,...
+		'doCrop', false,...
 		'doTransparent', false,...
-		'magnification', 2);
+		'magnification', 2,...
+		'resolution', 450,...
+		'hf', hf);
 	close(hf);
 	c_sayDone();
 end
@@ -535,7 +854,7 @@ if s.doDebug
     outputPath = fullfile(s.outputDir, [s.outputFilePrefix '_Debug_IntermediateTEPs.png']);
     hf = gcf;
     c_fig_arrange('maximize', hf, 'monitor', s.maximizePlotsToMonitor);
-    c_FigurePrinter.copyToFile(outputPath, 'magnification', 2, 'doTransparent', false);
+    c_FigurePrinter.copyToFile(outputPath, 'magnification', 2, 'resolution', 450, 'doTransparent', false);
     close(hf);
 	
 	if ~isempty(s.plotChans)
@@ -544,11 +863,231 @@ if s.doDebug
 		outputPath = fullfile(s.outputDir, [s.outputFilePrefix '_Debug_IntermediateERPIms.png']);
 		hf = gcf;
 		c_fig_arrange('maximize', hf, 'monitor',  s.maximizePlotsToMonitor);
-		c_FigurePrinter.copyToFile(outputPath, 'magnification', 2, 'doTransparent', false);
+		c_FigurePrinter.copyToFile(outputPath, 'magnification', 2, 'resolution', 450, 'doTransparent', false);
 		close(hf);
 	end
 end
 
+end
+
+function addSSPSIRInsetTopoplot(hf, haMain, xCoords, yCoords, channelColors)
+    if isempty(hf) || ~isgraphics(hf, 'figure') || isempty(haMain) || ~isgraphics(haMain, 'axes')
+        return;
+    end
+    if isempty(xCoords) || isempty(channelColors)
+        return;
+    end
+
+    % Normalise channel positions to a fixed head radius of 0.18
+    rMax = max(sqrt(xCoords.^2 + yCoords.^2));
+    if rMax > 0
+        xN = xCoords / rMax * 0.18;
+        yN = yCoords / rMax * 0.18;
+    else
+        xN = xCoords;
+        yN = yCoords;
+    end
+
+    % Size the inset as a pixel-square so the head is circular
+    figPos = hf.Position;  % [left bottom width_px height_px]
+    insetPx = 120;
+    insetW = insetPx / figPos(3);
+    insetH = insetPx / figPos(4);
+
+    mainPos = haMain.Position;
+    insetLeft   = mainPos(1) + mainPos(3) * 0.02;
+    insetBottom = mainPos(2) + mainPos(4) - insetH - mainPos(4) * 0.02;
+
+    haInset = axes('Parent', hf, 'Position', [insetLeft insetBottom insetW insetH]);
+    hold(haInset, 'on');
+
+    % Head outline
+    headR = 0.21;
+    th = linspace(0, 2*pi, 200);
+    plot(haInset, headR*cos(th), headR*sin(th), 'k-', 'LineWidth', 0.8);
+    % Nose
+    plot(haInset, [0 0.025 0 -0.025 0], [headR headR+0.04 headR+0.025 headR+0.04 headR], 'k-', 'LineWidth', 0.7);
+    % Ears
+    plot(haInset, [ headR  headR+0.025  headR+0.025], [0.04  0.025 -0.025], 'k-', 'LineWidth', 0.7);
+    plot(haInset, [-headR -headR-0.025 -headR-0.025], [0.04  0.025 -0.025], 'k-', 'LineWidth', 0.7);
+
+    % Channel dots — same index, same color as the line traces
+    for iCh = 1:size(channelColors, 1)
+        scatter(haInset, xN(iCh), yN(iCh), 18, channelColors(iCh,:), 'filled', 'MarkerEdgeColor', 'none');
+    end
+
+    axis(haInset, 'equal');
+    axis(haInset, 'off');
+    set(haInset, 'Color', 'none', 'XLim', [-0.27 0.27], 'YLim', [-0.27 0.27]);
+	uistack(haInset, 'top');
+end
+
+function legendText = getRejectedChannelsLegendText(EEG, badChannels)
+	if nargin < 2 || isempty(badChannels)
+		legendText = 'Rejected channels (0): none';
+		return;
+	end
+
+	badChannels = badChannels(:)';
+	channelLabels = cell(1, numel(badChannels));
+	for iCh = 1:numel(badChannels)
+		idx = badChannels(iCh);
+		if idx >= 1 && idx <= numel(EEG.chanlocs) && isfield(EEG.chanlocs, 'labels') && ~isempty(EEG.chanlocs(idx).labels)
+			channelLabels{iCh} = formatRejectedChannelLabel(EEG.chanlocs(idx).labels);
+		else
+			channelLabels{iCh} = formatRejectedChannelLabel(sprintf('Ch%d', idx));
+		end
+	end
+
+	maxLabelsPerLine = 5;
+	lineTexts = {};
+	for iStart = 1:maxLabelsPerLine:numel(channelLabels)
+		iEnd = min(iStart + maxLabelsPerLine - 1, numel(channelLabels));
+		lineTexts{end+1} = strjoin(channelLabels(iStart:iEnd), ', '); %#ok<AGROW>
+	end
+
+	if isempty(lineTexts)
+		legendText = sprintf('Rejected channels (%d): none', numel(badChannels));
+	elseif numel(lineTexts) == 1
+		legendText = sprintf('Rejected channels (%d): %s', numel(badChannels), lineTexts{1});
+	else
+		legendText = sprintf('Rejected channels (%d): %s\n%s', numel(badChannels), lineTexts{1}, strjoin(lineTexts(2:end), '\n'));
+	end
+end
+
+function shiftFigureAxesLeftForTimtopo(hf, shiftFraction)
+	if nargin < 2 || isempty(shiftFraction)
+		shiftFraction = 0.02;
+	end
+	if isempty(hf) || ~isgraphics(hf, 'figure')
+		return;
+	end
+
+	allAxes = findall(hf, 'type', 'axes');
+	for iAx = 1:numel(allAxes)
+		pos = get(allAxes(iAx), 'Position');
+		newPos = pos;
+		newPos(1) = max(0, pos(1) - shiftFraction);
+		newPos(3) = max(0, pos(3) - shiftFraction);
+		set(allAxes(iAx), 'Position', newPos);
+	end
+end
+
+function addRejectedChannelsTextNote(hObj, legendText, horizontalAlignment)
+	hf = [];
+	if isempty(hObj)
+		return;
+	end
+	if nargin < 3 || isempty(horizontalAlignment)
+		horizontalAlignment = 'left';
+	end
+
+	if isgraphics(hObj, 'figure')
+		hf = hObj;
+	elseif isgraphics(hObj)
+		hf = ancestor(hObj, 'figure');
+	end
+	if isempty(hf) || ~isgraphics(hf, 'figure')
+		return;
+	end
+
+	figure(hf);
+
+	allAxes = findall(hf, 'type', 'axes');
+	if isempty(allAxes)
+		return;
+	end
+
+	oldNotes = findall(hf, 'type', 'text', 'Tag', 'RejectedChannelsTextNote');
+	if ~isempty(oldNotes)
+		delete(oldNotes);
+	end
+
+	% Use the upper-most axis so the note appears in a consistent location.
+	axisTops = nan(numel(allAxes), 1);
+	for iAx = 1:numel(allAxes)
+		pos = get(allAxes(iAx), 'Position');
+		axisTops(iAx) = pos(2) + pos(4);
+	end
+	[~, idxTop] = max(axisTops);
+	targetAxis = allAxes(idxTop);
+
+	textX = 0.5;
+	if strcmpi(horizontalAlignment, 'left')
+		textX = 0.02;
+	end
+
+	text(targetAxis, textX, 1.08, legendText, ...
+		'Units', 'normalized', ...
+		'Tag', 'RejectedChannelsTextNote', ...
+		'Interpreter', 'tex', ...
+		'HorizontalAlignment', horizontalAlignment, ...
+		'VerticalAlignment', 'bottom', ...
+		'FontSize', 10, ...
+		'FontWeight', 'bold', ...
+		'Color', [0 0 0], ...
+		'Clipping', 'off');
+end
+
+function formattedLabel = formatRejectedChannelLabel(channelLabel)
+	channelLabel = strtrim(channelLabel);
+	escapedLabel = strrep(channelLabel, '_', '\_');
+	if strcmpi(channelLabel, 'GND')
+		formattedLabel = ['\color{red}' escapedLabel '\color{black}'];
+	else
+		formattedLabel = escapedLabel;
+	end
+end
+
+function adjustICAComponentFigureLayout(hf)
+    if isempty(hf) || ~isgraphics(hf, 'figure')
+        return;
+    end
+
+    % Make the overall figure a bit larger so the dense ICA panels have room.
+    figPos = get(hf, 'Position');
+    if isempty(figPos) || numel(figPos) < 4
+        figPos = [50 50 1400 900];
+    end
+    set(hf, 'Position', [figPos(1) figPos(2) max(figPos(3), 1400) max(figPos(4), 950)]);
+
+    allAxes = findall(hf, 'type', 'axes');
+    if ~isempty(allAxes)
+        for iAx = 1:numel(allAxes)
+            ax = allAxes(iAx);
+            ax.FontSize = 9;
+            ax.TitleFontSizeMultiplier = 1;
+            ax.LabelFontSizeMultiplier = 1;
+
+            % Give each subplot a bit more vertical space so labels do not collide.
+            axPos = ax.Position;
+            ax.Position = [axPos(1), axPos(2), axPos(3), axPos(4) * 0.88];
+        end
+    end
+
+    % Fine-tune the component-number buttons so they sit close to the topography
+    % plots but do not overlap the panel titles.
+    allButtons = findall(hf, 'type', 'uicontrol', 'Style', 'pushbutton');
+    if ~isempty(allButtons)
+        for iBtn = 1:numel(allButtons)
+            btn = allButtons(iBtn);
+            if isempty(btn.Tag) || isempty(regexp(btn.Tag, '^comp\d+$', 'once'))
+                continue;
+            end
+            btnPos = btn.Position;
+            btn.Position = [btnPos(1), max(0, btnPos(2) - 0.01), btnPos(3), btnPos(4)];
+        end
+    end
+
+    allText = findall(hf, 'type', 'text');
+    if ~isempty(allText)
+        set(allText, 'FontSize', 9);
+    end
+
+    allLegends = findall(hf, 'type', 'legend');
+    if ~isempty(allLegends)
+        set(allLegends, 'FontSize', 9);
+    end
 end
 
 function plotTEPComparison(s, EEGs, datasetLabels)
