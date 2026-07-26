@@ -39,7 +39,11 @@ function EEG = c_TMSEEG_Preprocess_AARATEPPipeline(varargin)
 %   'postNotchCleanupMethod': method to run after notch filtering. One of {'ICA','SSPSIR','BOTH'}
 %   'doSSPSIRBeforeICA': legacy flag, retained for backward compatibility
 %   'SSPSIRTimeRange': time range, in ms, used by SSP-SIR for artifact PCA (e.g. [0 20])
-%   'SSPSIRPC': SSP-SIR PC setting. Can be a scalar (fixed number of PCs) or e.g. {'data', 90}
+%   'SSPSIRPC': SSP-SIR PC setting. Can be:
+%                - scalar (fixed number of PCs)
+%                - {'data', 90} (TESA variance-threshold mode)
+%                - 'elbow' or {'elbow','explained'} (auto-pick PC at elbow of explained-variance curve)
+%                - {'elbow','cumulative'} (auto-pick PC at elbow of cumulative-variance curve)
 %   'ICAType': string, method of ICA to be used, as referenced in c_EEG_ICA
 %   'stimMuscleComponentThreshold': scalar, threshold over which to classify ICs as TMS-induced 
 %                                    muscle artifact
@@ -96,12 +100,13 @@ p.addParameter('lineNoiseNumHarmonics', 1, @isscalar);
 p.addParameter('postNotchCleanupMethod', 'ICA', @(x) ischar(x) || isstring(x));
 p.addParameter('doSSPSIRBeforeICA', true, @islogical);
 p.addParameter('SSPSIRTimeRange', [0 20], @(x) isnumeric(x) && length(x)==2);
-p.addParameter('SSPSIRPC', {'data', 90}, @(x) isnumeric(x) || iscell(x));
+p.addParameter('SSPSIRPC', {'data', 90}, @(x) isnumeric(x) || iscell(x) || ischar(x) || isstring(x));
 p.addParameter('ICAType', 'fastica', @ischar);
 p.addParameter('brainComponentThreshold', 0.3, @isscalar);
 p.addParameter('stimMuscleComponentThreshold', 8, @isscalar);
 p.addParameter('onOverRejection', 'pause', @ischar);
 p.addParameter('doPostICAArtifactInterpolation', false, @islogical);
+p.addParameter('doPlotLineNoiseQC', true, @islogical);
 p.addParameter('doDebug', false, @islogical);
 p.addParameter('doPlotFinalTimtopo', true, @islogical);
 p.addParameter('maximizePlotsToMonitor', 2, @isschar);
@@ -128,6 +133,7 @@ end
 md = struct();
 md.pipelineVersion = '2.1.1';
 md.postNotchCleanupMethod = s.postNotchCleanupMethod;
+md.didRunPostSSPSIRNotch = false;
 
 % check for required named arguments
 assert(~isempty(s.pulseEvents), 'Pulse event(s) must be specified');
@@ -453,24 +459,23 @@ if s.doDebug
 	intermediateLabels{end+1} = 'Artifact interpolated';
 end
 
+lineNoiseQC = initLineNoiseQC();
+lineNoiseQC = appendLineNoiseQC(lineNoiseQC, EEG, 'Before notch placement', s.lineNoiseFreq);
+
 %% notch
-c_say('Notch filtering');
-if false
-	EEG = pop_eegfiltnew(EEG, s.lineNoiseFreq-2, s.lineNoiseFreq+2, 2*EEG.srate, 1);
-else
-	EEG = c_EEG_filter_butterworth(EEG, s.lineNoiseFreq + [-2, 2], 'type', 'bandstop');
-	if true
-		% also (optionally) filter higher harmonics
-		% even though they will be low-passed later, can still interfere with ICA
-		for iHarmonic = 2:s.lineNoiseNumHarmonics
-			EEG = c_EEG_filter_butterworth(EEG, [-2, 2] + s.lineNoiseFreq*iHarmonic, 'type', 'bandstop');
-		end
-	end
+doRunSSPSIR = strcmp(s.postNotchCleanupMethod, 'SSPSIR') || strcmp(s.postNotchCleanupMethod, 'BOTH');
+doRunSecondICA = strcmp(s.postNotchCleanupMethod, 'ICA') || strcmp(s.postNotchCleanupMethod, 'BOTH');
+
+% Place notch before ICA only in ICA-only runs.
+if ~doRunSSPSIR && doRunSecondICA
+	c_say('Notch filtering (pre-ICA)');
+	EEG = applyLineNoiseNotches(EEG, s.lineNoiseFreq, s.lineNoiseNumHarmonics);
+	c_sayDone();
+	lineNoiseQC = appendLineNoiseQC(lineNoiseQC, EEG, 'After notch (pre-ICA)', s.lineNoiseFreq);
 end
-c_sayDone();
 
 %% SSP-SIR (TESA)
-if strcmp(s.postNotchCleanupMethod, 'SSPSIR') || strcmp(s.postNotchCleanupMethod, 'BOTH')
+if doRunSSPSIR
 	assert(exist('pop_tesa_sspsir', 'file') == 2,...
 		'TESA function pop_tesa_sspsir was not found on the MATLAB path');
 
@@ -484,13 +489,27 @@ if strcmp(s.postNotchCleanupMethod, 'SSPSIR') || strcmp(s.postNotchCleanupMethod
 
 	EEG_beforeSSPSIR = EEG;
 	allFigsBeforeSSPSIR = findall(0, 'type', 'figure');
+	sspsirPCQC = computeSSPSIRPCQC(EEG_beforeSSPSIR, s.SSPSIRTimeRange, s.SSPSIRPC);
+	sspsirPCForTESA = s.SSPSIRPC;
+	if isSSPSIRPCElbowMode(s.SSPSIRPC)
+		if isempty(sspsirPCQC) || ~isfield(sspsirPCQC, 'selectedPC') || isnan(sspsirPCQC.selectedPC)
+			error('SSPSIRPC elbow mode requested, but elbow PC could not be estimated from current data.');
+		end
+		sspsirPCForTESA = sspsirPCQC.selectedPC;
+		if isfield(sspsirPCQC, 'selectedPCSource') && ~isempty(sspsirPCQC.selectedPCSource)
+			c_saySingle('SSPSIRPC elbow mode resolved to %d PCs (%s elbow).', sspsirPCForTESA, sspsirPCQC.selectedPCSource);
+		else
+			c_saySingle('SSPSIRPC elbow mode resolved to %d PCs.', sspsirPCForTESA);
+		end
+	end
 
 	c_say('Running SSP-SIR');
 	EEG = pop_tesa_sspsir(EEG,...
 		'artScale', 'manual',...
 		'timeRange', s.SSPSIRTimeRange,...
-		'PC', s.SSPSIRPC);
+		'PC', sspsirPCForTESA);
 	c_sayDone();
+	plotSSPSIRPCQC(sspsirPCQC, fullfile(s.outputDir, [s.outputFilePrefix '_QC_SSPSIR_PCVariance.png']));
 
 	drawnow;
 	allFigsAfterSSPSIR = findall(0, 'type', 'figure');
@@ -630,6 +649,22 @@ if strcmp(s.postNotchCleanupMethod, 'SSPSIR') || strcmp(s.postNotchCleanupMethod
 	md.didRunSecondICA = false;
 	md.SSPSIR_timeRange = s.SSPSIRTimeRange;
 	md.SSPSIR_PC = s.SSPSIRPC;
+	md.SSPSIR_PCResolved = sspsirPCForTESA;
+	if ~isempty(sspsirPCQC)
+		md.SSPSIR_PCUsedEstimate = sspsirPCQC.selectedPC;
+		md.SSPSIR_PCTargetPercent = sspsirPCQC.targetPercent;
+		if isfield(sspsirPCQC, 'selectedPCSource')
+			md.SSPSIR_PCSelectionSource = sspsirPCQC.selectedPCSource;
+		end
+	end
+	lineNoiseQC = appendLineNoiseQC(lineNoiseQC, EEG, 'After SSPSIR (pre-notch)', s.lineNoiseFreq);
+
+	% For SSP-SIR branches (SSPSIR or BOTH), place notch after SSP-SIR.
+	c_say('Notch filtering (post-SSPSIR)');
+	EEG = applyLineNoiseNotches(EEG, s.lineNoiseFreq, s.lineNoiseNumHarmonics);
+	c_sayDone();
+	md.didRunPostSSPSIRNotch = true;
+	lineNoiseQC = appendLineNoiseQC(lineNoiseQC, EEG, 'After notch (post-SSPSIR)', s.lineNoiseFreq);
 
 	if s.doDebug
 		intermediateEEGs{end+1} = EEG;
@@ -640,7 +675,7 @@ else
 end
 
 %% ICA
-if strcmp(s.postNotchCleanupMethod, 'ICA') || strcmp(s.postNotchCleanupMethod, 'BOTH')
+if doRunSecondICA
 	md.didRunSecondICA = true;
 
 	c_say('Running ICA');
@@ -740,6 +775,7 @@ if strcmp(s.postNotchCleanupMethod, 'ICA') || strcmp(s.postNotchCleanupMethod, '
 	c_say('Rejecting %d/%d components', md.ICA_numRejComp, md.ICA_numComp);
 	EEG = pop_subcomp(EEG,find(misc.rejectComponents));
 	c_sayDone();
+	lineNoiseQC = appendLineNoiseQC(lineNoiseQC, EEG, 'After second ICA', s.lineNoiseFreq);
 
 	if s.doDebug
 		intermediateEEGs{end+1} = EEG;
@@ -779,6 +815,12 @@ end
 c_say('Rereferencing');
 EEG = pop_reref(EEG, []);
 c_sayDone();
+
+lineNoiseQC = appendLineNoiseQC(lineNoiseQC, EEG, 'Final output', s.lineNoiseFreq);
+
+if s.doPlotLineNoiseQC
+	plotLineNoiseQC(lineNoiseQC, s.lineNoiseFreq, fullfile(s.outputDir, [s.outputFilePrefix '_QC_LineNoise.png']));
+end
 
 if s.doDebug
     intermediateEEGs{end+1} = EEG;
@@ -868,6 +910,373 @@ if s.doDebug
 	end
 end
 
+end
+
+function qc = computeSSPSIRPCQC(EEG, timeRangeMs, PCSetting)
+	qc = struct();
+	qc.isValid = false;
+	qc.singularValues = [];
+	qc.eigenValues = [];
+	qc.explainedPct = [];
+	qc.cumulativePct = [];
+	qc.componentIdx = [];
+	qc.selectedPC = nan;
+	qc.selectedPCSource = '';
+	qc.targetPercent = nan;
+	qc.explainedElbowPC = nan;
+	qc.cumulativeElbowPC = nan;
+	qc.timeMs = [];
+	qc.capturePctOverTime = [];
+	qc.timeRangeMs = timeRangeMs;
+	qc.message = '';
+
+	if ~isfield(EEG, 'data') || isempty(EEG.data) || ~isfield(EEG, 'times') || isempty(EEG.times)
+		qc.message = 'Missing EEG data/times; SSP-SIR PC QC skipped.';
+		return;
+	end
+
+	data = double(EEG.data);
+	if ndims(data) == 3
+		data = mean(data, 3);
+	end
+
+	if size(data, 1) < 2 || size(data, 2) < 10
+		qc.message = 'Insufficient data dimensions for SSP-SIR PC QC.';
+		return;
+	end
+
+	dataAveRef = data - mean(data, 1);
+	Fs = EEG.srate;
+	if isempty(Fs) || ~isfinite(Fs) || Fs <= 0
+		qc.message = 'Invalid sampling rate; SSP-SIR PC QC skipped.';
+		return;
+	end
+
+	hpCutoff = 100;
+	if Fs <= 2*hpCutoff
+		hpCutoff = 0.45 * Fs;
+	end
+	wn = hpCutoff / (Fs/2);
+	if wn >= 1
+		qc.message = 'Sampling rate too low for SSPSIR-style high-pass QC.';
+		return;
+	end
+
+	[b, a] = butter(2, wn, 'high');
+	dataHigh = filtfilt(b, a, dataAveRef')';
+
+	timeRangeMs = reshape(timeRangeMs, [], 2);
+	dataShort = [];
+	for iWin = 1:size(timeRangeMs, 1)
+		[~, t1] = min(abs(EEG.times - timeRangeMs(iWin, 1)));
+		[~, t2] = min(abs(EEG.times - timeRangeMs(iWin, 2)));
+		if t2 < t1
+			tmp = t1;
+			t1 = t2;
+			t2 = tmp;
+		end
+		dataShort = [dataShort, dataHigh(:, t1:t2)]; %#ok<AGROW>
+	end
+
+	if isempty(dataShort) || size(dataShort, 2) < 2
+		qc.message = 'No samples found in SSP-SIR timeRange for PC QC.';
+		return;
+	end
+
+	[U, S, ~] = svd(dataShort, 'econ');
+	singularValues = diag(S);
+	if isempty(singularValues)
+		qc.message = 'SVD returned no components for SSP-SIR PC QC.';
+		return;
+	end
+
+	eigenValues = singularValues.^2;
+	totalVar = sum(eigenValues);
+	if totalVar <= 0 || ~isfinite(totalVar)
+		qc.message = 'Invalid eigenvalue total variance for SSP-SIR PC QC.';
+		return;
+	end
+
+	explainedPct = 100 * (eigenValues / totalVar);
+	cumulativePct = cumsum(explainedPct);
+	nComp = numel(singularValues);
+	componentIdx = 1:nComp;
+	explainedElbowPC = estimateElbowIndex(explainedPct);
+	cumulativeElbowPC = estimateElbowIndex(cumulativePct);
+
+	selectedPC = nan;
+	selectedPCSource = '';
+	targetPercent = nan;
+	if isnumeric(PCSetting) && isscalar(PCSetting)
+		selectedPC = max(1, min(nComp, round(PCSetting)));
+		selectedPCSource = 'fixed';
+	elseif (ischar(PCSetting) || isstring(PCSetting)) && strcmpi(strtrim(char(PCSetting)), 'elbow')
+		selectedPC = explainedElbowPC;
+		selectedPCSource = 'explained';
+	elseif iscell(PCSetting) && numel(PCSetting) >= 2 && ischar(PCSetting{1}) && strcmpi(PCSetting{1}, 'data')
+		targetPercent = PCSetting{2};
+		targetFrac = max(0, min(1, targetPercent/100));
+		tesaLikeCumFrac = (cumsum(singularValues).^2) ./ max((sum(singularValues).^2), eps);
+		selectedPC = find(tesaLikeCumFrac >= targetFrac, 1, 'first');
+		if isempty(selectedPC)
+			selectedPC = nComp;
+		end
+		selectedPCSource = 'data';
+	elseif iscell(PCSetting) && ~isempty(PCSetting) && (ischar(PCSetting{1}) || isstring(PCSetting{1})) && strcmpi(strtrim(char(PCSetting{1})), 'elbow')
+		elbowCurve = 'explained';
+		if numel(PCSetting) >= 2 && (ischar(PCSetting{2}) || isstring(PCSetting{2}))
+			elbowCurve = lower(strtrim(char(PCSetting{2})));
+		end
+		if strcmp(elbowCurve, 'cumulative')
+			selectedPC = cumulativeElbowPC;
+			selectedPCSource = 'cumulative';
+		else
+			selectedPC = explainedElbowPC;
+			selectedPCSource = 'explained';
+		end
+	end
+
+	if ~isnan(selectedPC)
+		selectedPC = max(1, min(nComp, selectedPC));
+		Usel = U(:, 1:selectedPC);
+		artifactProj = Usel * (Usel' * dataHigh);
+		totalPow = sum(dataHigh.^2, 1);
+		artifactPow = sum(artifactProj.^2, 1);
+		capturePctOverTime = 100 * (artifactPow ./ max(totalPow, eps));
+	else
+		capturePctOverTime = nan(1, size(dataHigh, 2));
+	end
+
+	qc.isValid = true;
+	qc.singularValues = singularValues;
+	qc.eigenValues = eigenValues;
+	qc.explainedPct = explainedPct;
+	qc.cumulativePct = cumulativePct;
+	qc.componentIdx = componentIdx;
+	qc.selectedPC = selectedPC;
+	qc.selectedPCSource = selectedPCSource;
+	qc.targetPercent = targetPercent;
+	qc.explainedElbowPC = explainedElbowPC;
+	qc.cumulativeElbowPC = cumulativeElbowPC;
+	qc.timeMs = EEG.times;
+	qc.capturePctOverTime = capturePctOverTime;
+end
+
+function tf = isSSPSIRPCElbowMode(PCSetting)
+	tf = false;
+	if ischar(PCSetting) || isstring(PCSetting)
+		tf = strcmpi(strtrim(char(PCSetting)), 'elbow');
+	elseif iscell(PCSetting) && ~isempty(PCSetting) && (ischar(PCSetting{1}) || isstring(PCSetting{1}))
+		tf = strcmpi(strtrim(char(PCSetting{1})), 'elbow');
+	end
+end
+
+function plotSSPSIRPCQC(qc, outputPath)
+	if isempty(qc) || ~isfield(qc, 'isValid') || ~qc.isValid
+		return;
+	end
+
+	hf = figure;
+	set(hf, 'Position', [50 50 1500 950]);
+	ht = tiledlayout(2, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
+	title(ht, 'SSP-SIR PCA QC: variance, eigenvalues, and time-resolved capture');
+
+	% If elbow mode is used, only show the elbow overlays for the elbow source
+	% that actually drives selectedPC; otherwise show both elbow overlays.
+	showExplainedElbow = true;
+	showCumulativeElbow = true;
+	if isfield(qc, 'selectedPCSource') && ~isempty(qc.selectedPCSource)
+		if strcmpi(qc.selectedPCSource, 'explained')
+			showCumulativeElbow = false;
+		elseif strcmpi(qc.selectedPCSource, 'cumulative')
+			showExplainedElbow = false;
+		end
+	end
+
+	ax1 = nexttile(1);
+	plot(ax1, qc.componentIdx, qc.explainedPct, 'o-', 'LineWidth', 1.5, 'MarkerSize', 4, 'Color', [0.12 0.47 0.71]);
+	hold(ax1, 'on');
+	if showExplainedElbow
+		plotElbowConstruction(ax1, qc.componentIdx, qc.explainedPct, qc.explainedElbowPC, 'Explained');
+	end
+	if showExplainedElbow && ~isnan(qc.explainedElbowPC)
+		xline(ax1, qc.explainedElbowPC, '--', 'Color', [0.58 0.15 0.65], 'LineWidth', 1.2, 'Label', sprintf('Elbow = %d', qc.explainedElbowPC), 'LabelVerticalAlignment', 'middle');
+		plot(ax1, qc.explainedElbowPC, qc.explainedPct(qc.explainedElbowPC), 'o', 'MarkerFaceColor', [0.58 0.15 0.65], 'MarkerEdgeColor', [0.58 0.15 0.65], 'MarkerSize', 7);
+	end
+	xlabel(ax1, 'Number of components');
+	ylabel(ax1, 'Variance explained per component (%)');
+	title(ax1, 'Explained variance spectrum');
+	grid(ax1, 'on');
+
+	ax2 = nexttile(2);
+	plot(ax2, qc.componentIdx, qc.cumulativePct, 'o-', 'LineWidth', 1.7, 'MarkerSize', 4, 'Color', [0.10 0.62 0.39]);
+	hold(ax2, 'on');
+	if showCumulativeElbow
+		plotElbowConstruction(ax2, qc.componentIdx, qc.cumulativePct, qc.cumulativeElbowPC, 'Cumulative');
+	end
+	if ~isnan(qc.selectedPC)
+		xline(ax2, qc.selectedPC, '--', 'Color', [0.85 0.33 0.10], 'LineWidth', 1.2, 'Label', sprintf('Selected PC = %d', qc.selectedPC), 'LabelVerticalAlignment', 'middle');
+		plot(ax2, qc.selectedPC, qc.cumulativePct(qc.selectedPC), 'o', 'MarkerFaceColor', [0.85 0.33 0.10], 'MarkerEdgeColor', [0.85 0.33 0.10], 'MarkerSize', 7);
+	end
+	if ~isnan(qc.targetPercent)
+		yline(ax2, qc.targetPercent, ':', 'Color', [0.85 0.33 0.10], 'LineWidth', 1.2, 'Label', sprintf('Target = %.1f%%', qc.targetPercent));
+	end
+	if showCumulativeElbow && ~isnan(qc.cumulativeElbowPC)
+		xline(ax2, qc.cumulativeElbowPC, '--', 'Color', [0.58 0.15 0.65], 'LineWidth', 1.2, 'Label', sprintf('Elbow = %d', qc.cumulativeElbowPC), 'LabelVerticalAlignment', 'middle');
+		plot(ax2, qc.cumulativeElbowPC, qc.cumulativePct(qc.cumulativeElbowPC), 'o', 'MarkerFaceColor', [0.58 0.15 0.65], 'MarkerEdgeColor', [0.58 0.15 0.65], 'MarkerSize', 7);
+	end
+	xlabel(ax2, 'Number of components');
+	ylabel(ax2, 'Cumulative variance (%)');
+	title(ax2, 'Cumulative variance captured');
+	grid(ax2, 'on');
+	ylim(ax2, [0 100]);
+
+	ax3 = nexttile(3);
+	semilogy(ax3, qc.componentIdx, qc.eigenValues, 'o-', 'LineWidth', 1.5, 'MarkerSize', 4, 'Color', [0.49 0.18 0.56]);
+	xlabel(ax3, 'Number of components');
+	ylabel(ax3, 'Eigenvalue (log scale)');
+	title(ax3, 'Eigenvalue scree (semilog)');
+	grid(ax3, 'on');
+
+	ax4 = nexttile(4);
+	plot(ax4, qc.timeMs, qc.capturePctOverTime, 'LineWidth', 1.6, 'Color', [0.20 0.20 0.20]);
+	hold(ax4, 'on');
+	xline(ax4, 0, 'k--');
+	if ~isempty(qc.timeRangeMs)
+		timeRangeMs = reshape(qc.timeRangeMs, [], 2);
+		for iWin = 1:size(timeRangeMs, 1)
+			xPatch = [timeRangeMs(iWin,1) timeRangeMs(iWin,2) timeRangeMs(iWin,2) timeRangeMs(iWin,1)];
+			yPatch = [0 0 100 100];
+			patch(ax4, xPatch, yPatch, [1.0 0.82 0.47], 'FaceAlpha', 0.20, 'EdgeColor', 'none');
+		end
+		uistack(findall(ax4, 'Type', 'line'), 'top');
+	end
+	xlabel(ax4, 'Time (ms)');
+	ylabel(ax4, 'Energy captured by selected SSP subspace (%)');
+	title(ax4, 'Time-resolved capture profile');
+	grid(ax4, 'on');
+	ylim(ax4, [0 100]);
+
+	if ~isnan(qc.selectedPC)
+		subtitleTxt = sprintf('Selected PC = %d', qc.selectedPC);
+		if ~isnan(qc.targetPercent)
+			subtitleTxt = sprintf('%s (target %.1f%%)', subtitleTxt, qc.targetPercent);
+		end
+		annotation(hf, 'textbox', [0.35 0.955 0.3 0.03], 'String', subtitleTxt, 'LineStyle', 'none', 'HorizontalAlignment', 'center', 'FontWeight', 'bold');
+	end
+
+	drawnow;
+	c_FigurePrinter.copyToFile(outputPath, 'magnification', 2, 'resolution', 350, 'doTransparent', false, 'hf', hf);
+	close(hf);
+end
+
+function plotElbowConstruction(ax, x, y, elbowIdx, labelPrefix)
+	if isempty(ax) || ~isgraphics(ax, 'axes') || isempty(x) || isempty(y) || isnan(elbowIdx)
+		return;
+	end
+
+	x = x(:);
+	y = y(:);
+	n = numel(y);
+	if numel(x) ~= n || elbowIdx < 1 || elbowIdx > n || n < 3
+		return;
+	end
+
+	% Draw the endpoint chord used by the knee finder.
+	xLine = [x(1), x(end)];
+	yLine = [y(1), y(end)];
+	plot(ax, xLine, yLine, '--', 'Color', [0.35 0.35 0.35], 'LineWidth', 1.1, 'HandleVisibility', 'off');
+
+	% Compute and draw the projection in display-space so the segment looks
+	% perpendicular on the rendered axes, even when x/y axis scales differ.
+	xLim = xlim(ax);
+	yLim = ylim(ax);
+	if diff(xLim) <= 0 || diff(yLim) <= 0
+		return;
+	end
+
+	% Axis size in screen pixels (including parent transforms).
+	try
+		axPix = getpixelposition(ax, true);
+	catch
+		axPix = getpixelposition(ax);
+	end
+	if isempty(axPix) || numel(axPix) < 4 || axPix(3) <= 0 || axPix(4) <= 0
+		return;
+	end
+
+	sx = axPix(3) / max(diff(xLim), eps);
+	sy = axPix(4) / max(diff(yLim), eps);
+
+	toDisp = @(xd, yd) [(xd - xLim(1)) * sx, (yd - yLim(1)) * sy];
+	toData = @(xp, yp) [xp / sx + xLim(1), yp / sy + yLim(1)];
+
+	p1 = toDisp(x(1), y(1));
+	p2 = toDisp(x(end), y(end));
+	v = p2 - p1;
+	vDen = sum(v.^2);
+	if vDen <= eps
+		return;
+	end
+
+	p = toDisp(x(elbowIdx), y(elbowIdx));
+	t = dot(p - p1, v) / vDen;
+	pProj = p1 + t * v;
+
+	pProjData = toData(pProj(1), pProj(2));
+	xProj = pProjData(1);
+	yProj = pProjData(2);
+	plot(ax, [x(elbowIdx) xProj], [y(elbowIdx) yProj], '-', 'Color', [0.58 0.15 0.65], 'LineWidth', 2.0, 'HandleVisibility', 'off');
+
+	% No text annotation: keep the geometric construction clean.
+end
+
+function elbowIdx = estimateElbowIndex(curveY)
+	elbowIdx = nan;
+	if isempty(curveY)
+		return;
+	end
+
+	y = curveY(:);
+	n = numel(y);
+	if n < 3
+		return;
+	end
+	if any(~isfinite(y))
+		return;
+	end
+
+	x = (1:n)';
+	xNorm = (x - x(1)) / max((x(end) - x(1)), eps);
+
+	yMin = min(y);
+	yMax = max(y);
+	if yMax <= yMin
+		return;
+	end
+	yNorm = (y - yMin) / (yMax - yMin);
+	p1 = [xNorm(1), yNorm(1)];
+	p2 = [xNorm(end), yNorm(end)];
+	v = p2 - p1;
+	vDen = sum(v.^2);
+	if vDen <= eps
+		return;
+	end
+
+	d = nan(n, 1);
+	for iPt = 1:n
+		p = [xNorm(iPt), yNorm(iPt)];
+		t = dot(p - p1, v) / vDen;
+		pProj = p1 + t * v;
+		d(iPt) = norm(p - pProj);
+	end
+
+	d(1) = -inf;
+	d(end) = -inf;
+	[~, idx] = max(d);
+	if isfinite(d(idx)) && d(idx) > 0
+		elbowIdx = idx;
+	end
 end
 
 function addSSPSIRInsetTopoplot(hf, haMain, xCoords, yCoords, channelColors)
@@ -1088,6 +1497,135 @@ function adjustICAComponentFigureLayout(hf)
     if ~isempty(allLegends)
         set(allLegends, 'FontSize', 9);
     end
+end
+
+function EEG = applyLineNoiseNotches(EEG, lineNoiseFreq, lineNoiseNumHarmonics)
+	EEG = c_EEG_filter_butterworth(EEG, lineNoiseFreq + [-2, 2], 'type', 'bandstop');
+	for iHarmonic = 2:lineNoiseNumHarmonics
+		harmonicBand = [-2, 2] + lineNoiseFreq*iHarmonic;
+		if harmonicBand(2) < EEG.srate/2
+			EEG = c_EEG_filter_butterworth(EEG, harmonicBand, 'type', 'bandstop');
+		end
+	end
+end
+
+function qc = initLineNoiseQC()
+	qc = struct();
+	qc.stageLabels = {};
+	qc.lineBandPower = [];
+	qc.lineToSideDb = [];
+	qc.freq = [];
+	qc.spectrumDb = [];
+end
+
+function qc = appendLineNoiseQC(qc, EEG, stageLabel, lineNoiseFreq)
+	[lineBandPower, lineToSideDb, freq, spectrumDb] = computeLineNoiseMetric(EEG, lineNoiseFreq);
+	qc.stageLabels{end+1} = stageLabel;
+	qc.lineBandPower(end+1) = lineBandPower;
+	qc.lineToSideDb(end+1) = lineToSideDb;
+	if isempty(qc.freq)
+		qc.freq = freq;
+	end
+	if isempty(qc.spectrumDb)
+		qc.spectrumDb = spectrumDb(:)';
+	else
+		qc.spectrumDb(end+1, :) = spectrumDb(:)';
+	end
+end
+
+function [lineBandPower, lineToSideDb, freq, spectrumDb] = computeLineNoiseMetric(EEG, lineNoiseFreq)
+	lineBandPower = nan;
+	lineToSideDb = nan;
+	freq = [];
+	spectrumDb = [];
+
+	if ~isfield(EEG, 'data') || isempty(EEG.data) || ~isfield(EEG, 'srate') || isempty(EEG.srate)
+		return;
+	end
+
+	data = double(EEG.data);
+	if ndims(data) == 3
+		data = reshape(data, size(data, 1), []);
+	end
+	if isempty(data) || size(data, 2) < 16
+		return;
+	end
+
+	data = data - mean(data, 2);
+	nSamples = size(data, 2);
+	nFft = 2^nextpow2(min(nSamples, 2^15));
+	if nFft < 256
+		nFft = nSamples;
+	end
+
+	fftData = fft(data, nFft, 2);
+	pow = (abs(fftData).^2) / nFft;
+	nHalf = floor(nFft/2) + 1;
+	pow = pow(:, 1:nHalf);
+	if nHalf > 2
+		pow(:, 2:end-1) = 2*pow(:, 2:end-1);
+	end
+
+	freq = (0:nHalf-1) * (EEG.srate/nFft);
+	meanPow = mean(pow, 1);
+	spectrumDb = 10*log10(max(meanPow, eps));
+
+	lineMask = freq >= (lineNoiseFreq - 1) & freq <= (lineNoiseFreq + 1);
+	sideMask = (freq >= (lineNoiseFreq - 5) & freq <= (lineNoiseFreq - 3)) | ...
+		(freq >= (lineNoiseFreq + 3) & freq <= (lineNoiseFreq + 5));
+
+	if ~any(sideMask)
+		sideMask = (freq >= (lineNoiseFreq - 8) & freq <= (lineNoiseFreq - 4)) | ...
+			(freq >= (lineNoiseFreq + 4) & freq <= (lineNoiseFreq + 8));
+	end
+
+	if any(lineMask)
+		lineBandPower = mean(meanPow(lineMask));
+	end
+
+	if any(sideMask)
+		sidePower = mean(meanPow(sideMask));
+		lineToSideDb = 10*log10(max(lineBandPower, eps) / max(sidePower, eps));
+	end
+end
+
+function plotLineNoiseQC(qc, lineNoiseFreq, outputPath)
+	if isempty(qc) || isempty(qc.stageLabels)
+		return;
+	end
+
+	hf = figure;
+	hf.Position = [50 50 1100 420];
+	ht = tiledlayout(1, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
+	title(ht, sprintf('Line-noise QC around %.1f Hz', lineNoiseFreq));
+
+	axMetric = nexttile(1);
+	bar(axMetric, qc.lineToSideDb, 0.7, 'FaceColor', [0.20 0.50 0.75]);
+	set(axMetric, 'XTick', 1:numel(qc.stageLabels), 'XTickLabel', qc.stageLabels, 'XTickLabelRotation', 25);
+	ylabel(axMetric, sprintf('%.1f Hz power vs sidebands (dB)', lineNoiseFreq));
+	title(axMetric, 'Relative line-noise power by stage');
+	grid(axMetric, 'on');
+
+	axSpec = nexttile(2);
+	hold(axSpec, 'on');
+	for iStage = 1:size(qc.spectrumDb, 1)
+		plot(axSpec, qc.freq, qc.spectrumDb(iStage, :), 'LineWidth', 1.1);
+	end
+	xline(axSpec, lineNoiseFreq, 'k--', 'LineWidth', 1);
+	xlabel(axSpec, 'Frequency (Hz)');
+	ylabel(axSpec, 'Mean power (dB)');
+	title(axSpec, 'Spectrum around line-noise band');
+	grid(axSpec, 'on');
+	xlim(axSpec, [max(1, lineNoiseFreq - 20), lineNoiseFreq + 20]);
+	legend(axSpec, qc.stageLabels, 'Location', 'northeast', 'Interpreter', 'none');
+
+	drawnow;
+	c_FigurePrinter.copyToFile(outputPath, ...
+		'magnification', 2, ...
+		'resolution', 350, ...
+		'doTransparent', false, ...
+		'hf', hf);
+	close(hf);
 end
 
 function plotTEPComparison(s, EEGs, datasetLabels)
