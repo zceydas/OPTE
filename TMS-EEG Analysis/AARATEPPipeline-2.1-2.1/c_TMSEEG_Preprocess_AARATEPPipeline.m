@@ -15,7 +15,9 @@ function EEG = c_TMSEEG_Preprocess_AARATEPPipeline(varargin)
 %   'artifactTimespan': timespan, in seconds, within which to replace data with interpolated values
 %   'baselineTimespan': timespan, in seconds, to use for per-epoch baseline subtraction
 %   'doEarlyArtifactInterpolation': whether to interpolate the artifact timespan before early processing
-%   'doPostICAArtifactInterpolation': whether to interpolate the artifact timespan after ICA cleanup
+%   'doPostDecayArtifactInterpolation': whether to interpolate the artifact timespan after decay-removal stage
+%   'doPostCleanupArtifactInterpolation': whether to interpolate the artifact timespan after final cleanup (ICA/SSPSIR)
+%   'doPostICAArtifactInterpolation': legacy umbrella flag for both post-decay and post-cleanup interpolation
 %   'doBaselineCorrection': whether to apply baseline subtraction after downsampling
 %   'doHighPassFiltering': whether to apply the high-pass filtering stage
 %   'doBasicChannelRejection': whether to run the early bad-channel detection stage
@@ -81,6 +83,8 @@ p.addParameter('epochTimespan', [], @c_isSpan);
 p.addParameter('artifactTimespan', [-0.002, 0.009], @c_isSpan); %Upper bound was originally 12 ms
 p.addParameter('baselineTimespan', [-0.5 -0.01], @c_isSpan);
 p.addParameter('doEarlyArtifactInterpolation', true, @islogical);
+p.addParameter('doPostDecayArtifactInterpolation', [], @(x) (islogical(x) && isscalar(x)) || isempty(x));
+p.addParameter('doPostCleanupArtifactInterpolation', [], @(x) (islogical(x) && isscalar(x)) || isempty(x));
 p.addParameter('doBaselineCorrection', true, @islogical);
 p.addParameter('doHighPassFiltering', true, @islogical);
 p.addParameter('doBasicChannelRejection', true, @islogical);
@@ -116,6 +120,24 @@ p.addParameter('plotChans', {'Fz', 'Pz'}, @(x) iscellstr(x) || isnumeric(x));
 p.parse(varargin{:});
 s = p.Results;
 EEG = s.EEG;
+
+% Backward compatibility: legacy doPostICAArtifactInterpolation can still
+% control either or both post-cleanup interpolation stages when explicit
+% stage-specific flags are not provided.
+if isempty(s.doPostDecayArtifactInterpolation)
+	if ~ismember('doPostICAArtifactInterpolation', p.UsingDefaults)
+		s.doPostDecayArtifactInterpolation = s.doPostICAArtifactInterpolation;
+	else
+		s.doPostDecayArtifactInterpolation = false;
+	end
+end
+if isempty(s.doPostCleanupArtifactInterpolation)
+	if ~ismember('doPostICAArtifactInterpolation', p.UsingDefaults)
+		s.doPostCleanupArtifactInterpolation = s.doPostICAArtifactInterpolation;
+	else
+		s.doPostCleanupArtifactInterpolation = false;
+	end
+end
 
 s.postNotchCleanupMethod = upper(strtrim(char(s.postNotchCleanupMethod)));
 if strcmp(s.postNotchCleanupMethod, 'SSPSIR+ICA') || strcmp(s.postNotchCleanupMethod, 'SSPSIR_ICA') || strcmp(s.postNotchCleanupMethod, 'SSPSIRANDICA') || strcmp(s.postNotchCleanupMethod, 'BOTH')
@@ -443,15 +465,22 @@ else
 end
 
 %% interpolate artifact timespan (to remove any large decay residuals in artifactTimespan)
-if s.doPostICAArtifactInterpolation
+if s.doPostDecayArtifactInterpolation
+	EEG_beforePostDecayInterp = EEG;
 	c_say('Interpolating artifact timespan');
 	EEG = c_EEG_ReplaceEpochTimeSegment(EEG,...
 		'timespanToReplace', s.artifactTimespan,...
 		'method', 'ARExtrapolation',...
 		'prePostFitDurations', [20 20]*1e-3);
 	c_sayDone();
+	plotArtifactInterpolationQC(...
+		EEG_beforePostDecayInterp,...
+		EEG,...
+		s.artifactTimespan,...
+		'Post-decay artifact interpolation',...
+		fullfile(s.outputDir, [s.outputFilePrefix '_QC_ArtifactInterpolation_PostDecay.png']));
 else
-	c_saySingle('Skipping artifact interpolation stage.');
+	c_saySingle('Skipping post-decay artifact interpolation stage.');
 end
 
 if s.doDebug
@@ -792,13 +821,20 @@ else
 end
 
 %% interpolate again
-if s.doPostICAArtifactInterpolation && (strcmp(s.postNotchCleanupMethod, 'ICA') || strcmp(s.postNotchCleanupMethod, 'BOTH'))
+if s.doPostCleanupArtifactInterpolation && (strcmp(s.postNotchCleanupMethod, 'ICA') || strcmp(s.postNotchCleanupMethod, 'BOTH'))
+	EEG_beforePostCleanupInterp = EEG;
 	c_say('Interpolating artifact timespan');
 	EEG = c_EEG_ReplaceEpochTimeSegment(EEG,...
 		'timespanToReplace', s.artifactTimespan,...
 		'method', 'ARExtrapolation',...
 		'prePostFitDurations', [20 20]*1e-3);
 	c_sayDone();
+	plotArtifactInterpolationQC(...
+		EEG_beforePostCleanupInterp,...
+		EEG,...
+		s.artifactTimespan,...
+		'Post-cleanup artifact interpolation',...
+		fullfile(s.outputDir, [s.outputFilePrefix '_QC_ArtifactInterpolation_PostCleanup.png']));
 end
 
 %% low-pass
@@ -1107,6 +1143,7 @@ function plotSSPSIRPCQC(qc, outputPath)
 	ylabel(ax1, 'Variance explained per component (%)');
 	title(ax1, 'Explained variance spectrum');
 	grid(ax1, 'on');
+	addPCRemovalShade(ax1, qc.selectedPC, numel(qc.componentIdx));
 
 	ax2 = nexttile(2);
 	plot(ax2, qc.componentIdx, qc.cumulativePct, 'o-', 'LineWidth', 1.7, 'MarkerSize', 4, 'Color', [0.10 0.62 0.39]);
@@ -1130,13 +1167,16 @@ function plotSSPSIRPCQC(qc, outputPath)
 	title(ax2, 'Cumulative variance captured');
 	grid(ax2, 'on');
 	ylim(ax2, [0 100]);
+	addPCRemovalShade(ax2, qc.selectedPC, numel(qc.componentIdx));
 
 	ax3 = nexttile(3);
 	semilogy(ax3, qc.componentIdx, qc.eigenValues, 'o-', 'LineWidth', 1.5, 'MarkerSize', 4, 'Color', [0.49 0.18 0.56]);
+	hold(ax3, 'on');
 	xlabel(ax3, 'Number of components');
 	ylabel(ax3, 'Eigenvalue (log scale)');
 	title(ax3, 'Eigenvalue scree (semilog)');
 	grid(ax3, 'on');
+	addPCRemovalShade(ax3, qc.selectedPC, numel(qc.componentIdx));
 
 	ax4 = nexttile(4);
 	plot(ax4, qc.timeMs, qc.capturePctOverTime, 'LineWidth', 1.6, 'Color', [0.20 0.20 0.20]);
@@ -1168,6 +1208,39 @@ function plotSSPSIRPCQC(qc, outputPath)
 	drawnow;
 	c_FigurePrinter.copyToFile(outputPath, 'magnification', 2, 'resolution', 350, 'doTransparent', false, 'hf', hf);
 	close(hf);
+end
+
+function addPCRemovalShade(ax, selectedPC, nComp)
+	if isempty(ax) || ~isgraphics(ax, 'axes') || isempty(selectedPC) || isnan(selectedPC)
+		return;
+	end
+	if nargin < 3 || isempty(nComp) || ~isfinite(nComp) || nComp < 1
+		nComp = max(1, round(selectedPC));
+	end
+
+	selectedPC = max(1, min(round(selectedPC), round(nComp)));
+	xStart = 0.5;
+	xEnd = selectedPC + 0.5;
+
+	yLim = ylim(ax);
+	if any(~isfinite(yLim)) || yLim(2) <= yLim(1)
+		return;
+	end
+
+	xPatch = [xStart xEnd xEnd xStart];
+	yPatch = [yLim(1) yLim(1) yLim(2) yLim(2)];
+	patch(ax, xPatch, yPatch, [0.93 0.95 1.00], ...
+		'FaceAlpha', 0.50, ...
+		'EdgeColor', 'none', ...
+		'HandleVisibility', 'off');
+
+	xline(ax, xEnd, '-', 'Color', [0.30 0.45 0.85], 'LineWidth', 1.0, ...
+		'Label', 'Removed PCs', 'LabelVerticalAlignment', 'bottom', 'HandleVisibility', 'off');
+
+	children = get(ax, 'Children');
+	if ~isempty(children)
+		uistack(children(1), 'bottom');
+	end
 end
 
 function plotElbowConstruction(ax, x, y, elbowIdx, labelPrefix)
@@ -1626,6 +1699,128 @@ function plotLineNoiseQC(qc, lineNoiseFreq, outputPath)
 		'doTransparent', false, ...
 		'hf', hf);
 	close(hf);
+end
+
+function plotArtifactInterpolationQC(EEG_before, EEG_after, artifactTimespan, stageLabel, outputPath)
+	if nargin < 5 || isempty(outputPath)
+		return;
+	end
+	if isempty(EEG_before) || isempty(EEG_after) || ~isfield(EEG_before, 'data') || ~isfield(EEG_after, 'data')
+		return;
+	end
+
+	beforeData = double(EEG_before.data);
+	afterData = double(EEG_after.data);
+	if isempty(beforeData) || isempty(afterData)
+		return;
+	end
+	if ndims(beforeData) == 3
+		beforeMean = squeeze(mean(beforeData, 3));
+	else
+		beforeMean = beforeData;
+	end
+	if ndims(afterData) == 3
+		afterMean = squeeze(mean(afterData, 3));
+	else
+		afterMean = afterData;
+	end
+	if size(beforeMean, 1) ~= size(afterMean, 1) || size(beforeMean, 2) ~= size(afterMean, 2)
+		return;
+	end
+
+	if isfield(EEG_after, 'times') && ~isempty(EEG_after.times)
+		timeMs = EEG_after.times;
+	elseif isfield(EEG_before, 'times') && ~isempty(EEG_before.times)
+		timeMs = EEG_before.times;
+	else
+		timeMs = 1:size(beforeMean, 2);
+	end
+
+	if size(beforeMean, 2) ~= numel(timeMs)
+		return;
+	end
+
+	gmfaBefore = sqrt(mean((beforeMean - mean(beforeMean, 1)).^2, 1));
+	gmfaAfter = sqrt(mean((afterMean - mean(afterMean, 1)).^2, 1));
+
+	channelAvgBefore = mean(beforeMean, 1);
+	channelAvgAfter = mean(afterMean, 1);
+	deltaTrace = channelAvgAfter - channelAvgBefore;
+
+	hf = figure;
+	set(hf, 'Position', [50 50 1550 950]);
+	ht = tiledlayout(3, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
+	title(ht, sprintf('%s QC: pre vs post interpolation', stageLabel));
+
+	ax1 = nexttile(1);
+	hold(ax1, 'on');
+	hPre1 = plot(ax1, timeMs, channelAvgBefore, 'LineWidth', 1.6, 'Color', [0.20 0.45 0.80]);
+	hPost1 = plot(ax1, timeMs, channelAvgAfter, 'LineWidth', 1.6, 'Color', [0.85 0.33 0.10]);
+	xline(ax1, 0, 'k--');
+	shadeArtifactWindow(ax1, artifactTimespan);
+	xlabel(ax1, 'Time (ms)');
+	ylabel(ax1, 'Amplitude (\muV)');
+	title(ax1, 'Channel-average TEP');
+	legend(ax1, [hPre1 hPost1], {'Pre interpolation', 'Post interpolation'}, 'Location', 'northwest');
+	grid(ax1, 'on');
+
+	ax2 = nexttile(2);
+	hold(ax2, 'on');
+	hPre2 = plot(ax2, timeMs, gmfaBefore, 'LineWidth', 1.6, 'Color', [0.15 0.15 0.15]);
+	hPost2 = plot(ax2, timeMs, gmfaAfter, 'LineWidth', 1.6, 'Color', [0.15 0.55 0.30]);
+	xline(ax2, 0, 'k--');
+	shadeArtifactWindow(ax2, artifactTimespan);
+	xlabel(ax2, 'Time (ms)');
+	ylabel(ax2, 'GMFA (\muV)');
+	title(ax2, 'Global mean field amplitude');
+	legend(ax2, [hPre2 hPost2], {'Pre interpolation', 'Post interpolation'}, 'Location', 'northwest');
+	grid(ax2, 'on');
+
+	ax3 = nexttile(3);
+	hold(ax3, 'on');
+	plot(ax3, timeMs, deltaTrace, 'LineWidth', 1.6, 'Color', [0.58 0.15 0.65]);
+	xline(ax3, 0, 'k--');
+	yline(ax3, 0, 'k:');
+	shadeArtifactWindow(ax3, artifactTimespan);
+	xlabel(ax3, 'Time (ms)');
+	ylabel(ax3, '\Delta amplitude (\muV)');
+	title(ax3, 'Post - pre (channel-average difference)');
+	grid(ax3, 'on');
+
+	linkaxes([ax1 ax2 ax3], 'x');
+	xlim([timeMs(1) timeMs(end)]);
+
+	drawnow;
+	c_FigurePrinter.copyToFile(outputPath, ...
+		'magnification', 2, ...
+		'resolution', 350, ...
+		'doTransparent', false, ...
+		'hf', hf);
+	close(hf);
+end
+
+function shadeArtifactWindow(ax, artifactTimespan)
+	if isempty(ax) || ~isgraphics(ax, 'axes') || isempty(artifactTimespan)
+		return;
+	end
+
+	artifactTimespanMs = artifactTimespan * 1e3;
+	if numel(artifactTimespanMs) ~= 2 || any(~isfinite(artifactTimespanMs))
+		return;
+	end
+	winStart = min(artifactTimespanMs);
+	winEnd = max(artifactTimespanMs);
+	yLim = ylim(ax);
+	if ~all(isfinite(yLim)) || yLim(2) <= yLim(1)
+		return;
+	end
+
+	patch(ax, [winStart winEnd winEnd winStart], [yLim(1) yLim(1) yLim(2) yLim(2)], ...
+		[1.00 0.90 0.75], 'FaceAlpha', 0.22, 'EdgeColor', 'none', 'HandleVisibility', 'off');
+	children = get(ax, 'Children');
+	if ~isempty(children)
+		uistack(children(1), 'bottom');
+	end
 end
 
 function plotTEPComparison(s, EEGs, datasetLabels)
