@@ -15,7 +15,7 @@ function metrics_effort = effort_selection_from_structs
 %       → Using block-wise Order changes to classify trials as:
 %             - Switch trial: Order(i) ~= Order(i-1) within same BlockNo
 %             - Repeat trial: Order(i) == Order(i-1) within same BlockNo
-%           (first trial in each block is treated as Repeat)
+%           (first trial in each block is neither Switch nor Repeat)
 %
 %       Metrics per EffortLevel:
 %           n_switch_learning      (# valid switch trials, Accuracy < 9)
@@ -499,6 +499,7 @@ function metrics = computeSwitchRepeatMetrics(M)
     correct = T.Accuracy == 1;
 
     isSwitch = false(n,1);
+    isRepeat = false(n,1);
     blocks = unique(T.BlockNo(~isnan(T.BlockNo)));
     for ib = 1:numel(blocks)
         b = blocks(ib);
@@ -508,9 +509,14 @@ function metrics = computeSwitchRepeatMetrics(M)
         end
         ord = T.Order(idx);
         swLocal = [false; diff(ord) ~= 0];
+        rpLocal = [false; diff(ord) == 0];
         isSwitch(idx) = swLocal;
+        isRepeat(idx) = rpLocal;
     end
-    isRepeat = ~isSwitch;
+
+    % Exclude RTs below 200 ms from RT means (Sayali & Badre, 2019;
+    % doi:10.1016/j.neuropsychologia.2018.06.016).
+    validRT = isfinite(T.RT) & T.RT >= 0.200;
 
     eff_levels = unique(T.EffortLevel(~isnan(T.EffortLevel)));
 
@@ -537,7 +543,7 @@ function metrics = computeSwitchRepeatMetrics(M)
 
         if n_sw > 0
             sw_acc = sum(swIdx & correct) / n_sw;
-            sw_rt  = mean(T.RT(swIdx & correct), 'omitnan');
+            sw_rt  = mean(T.RT(swIdx & correct & validRT), 'omitnan');
         else
             sw_acc = NaN;
             sw_rt  = NaN;
@@ -545,7 +551,7 @@ function metrics = computeSwitchRepeatMetrics(M)
 
         if n_rep > 0
             rep_acc = sum(repIdx & correct) / n_rep;
-            rep_rt  = mean(T.RT(repIdx & correct), 'omitnan');
+            rep_rt  = mean(T.RT(repIdx & correct & validRT), 'omitnan');
         else
             rep_acc = NaN;
             rep_rt  = NaN;
@@ -607,8 +613,9 @@ function metrics = computeSelectionMetrics(Msel)
             p_select = NaN;
         end
 
-        if n_chosen > 0
-            decision_rt = mean(T.RT(chosen), 'omitnan');
+        validDecisionRT = chosen & isfinite(T.RT) & T.RT >= 0.200;
+        if any(validDecisionRT)
+            decision_rt = mean(T.RT(validDecisionRT), 'omitnan');
         else
             decision_rt = NaN;
         end

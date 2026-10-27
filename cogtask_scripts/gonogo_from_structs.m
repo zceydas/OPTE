@@ -195,9 +195,11 @@ for k = 1:numel(files)
     nNoGo  = sum(isGo == 0);
     hits   = sum(isGo & correct);
     fas    = sum(~isGo & responded);
-    rt_sum = sum(RT(isGo & correct), 'omitnan');
+    valid_rt = isGo & correct & isfinite(RT) & RT >= 0.200;
+    rt_sum = sum(RT(valid_rt), 'omitnan');
+    rt_n   = sum(valid_rt);
 
-    rows = [rows; makeFileRow(pid, period, nGo, nNoGo, hits, fas, rt_sum, fpath, sesnum)]; %#ok<AGROW>
+    rows = [rows; makeFileRow(pid, period, nGo, nNoGo, hits, fas, rt_sum, rt_n, fpath, sesnum)]; %#ok<AGROW>
     inventory_rows = [inventory_rows; inv]; %#ok<AGROW>
 end
 
@@ -217,12 +219,13 @@ agg.nNoGo  = splitapply(@nansum, file_metrics.n_nogo,  grp);
 agg.hits   = splitapply(@nansum, file_metrics.hits,    grp);
 agg.fas    = splitapply(@nansum, file_metrics.fas,     grp);
 agg.rt_sum = splitapply(@nansum, file_metrics.rt_sum,  grp);
+agg.rt_n   = splitapply(@nansum, file_metrics.rt_n,    grp);
 
 [pIDs, periods] = splitapply(@firstPair, file_metrics.participant, file_metrics.period, grp); %#ok<ASGLU>
 
 metrics_by_period = table(pIDs, periods, ...
-    agg.nGo, agg.nNoGo, agg.hits, agg.fas, agg.rt_sum, ...
-    'VariableNames', {'participant','period','n_go','n_nogo','hits','fas','rt_sum'});
+    agg.nGo, agg.nNoGo, agg.hits, agg.fas, agg.rt_sum, agg.rt_n, ...
+    'VariableNames', {'participant','period','n_go','n_nogo','hits','fas','rt_sum','rt_n'});
 
 % SDT rates (Hautus), z, d', c, mean RT (weighted)
 metrics_by_period.H   = arrayfun(@(h,n) safeRate(h, n),  metrics_by_period.hits,  metrics_by_period.n_go);
@@ -231,8 +234,12 @@ metrics_by_period.zH  = safeNormInv(metrics_by_period.H);
 metrics_by_period.zFA = safeNormInv(metrics_by_period.FA);
 metrics_by_period.dprime    = metrics_by_period.zH - metrics_by_period.zFA;
 metrics_by_period.criterion = -0.5 * (metrics_by_period.zH + metrics_by_period.zFA);
-metrics_by_period.mean_rt   = metrics_by_period.rt_sum ./ metrics_by_period.hits;
-metrics_by_period.mean_rt(metrics_by_period.hits==0) = NaN;
+metrics_by_period.mean_rt   = metrics_by_period.rt_sum ./ metrics_by_period.rt_n;
+metrics_by_period.mean_rt(metrics_by_period.rt_n==0) = NaN;
+
+% Keep valid-RT counts internal so existing outputs retain their schemas.
+file_metrics_export = removevars(file_metrics, 'rt_n');
+metrics_by_period = removevars(metrics_by_period, 'rt_n');
 
 % ROBUST ORDERING (fix for your error)
 % Make categorical, then reorder only to the intersection with PERIOD_ORDER.
@@ -245,7 +252,7 @@ metrics_by_period = sortrows(metrics_by_period, {'participant','period'});
 
 % Save CSV
 try
-    writetable(file_metrics, csv_out_filelevel);
+    writetable(file_metrics_export, csv_out_filelevel);
     writetable(metrics_by_period, csv_out);
 catch
     warning('Could not write one or more Go/No-Go CSV files. Check whether a file is open.');
@@ -338,7 +345,7 @@ function mustHave(T, name, fname)
     end
 end
 
-function row = makeFileRow(pid, period, nGo, nNoGo, hits, fas, rt_sum, fpath, sesnum)
+function row = makeFileRow(pid, period, nGo, nNoGo, hits, fas, rt_sum, rt_n, fpath, sesnum)
     row.participant = string(pid);
     row.period      = string(period);
     row.sesnum      = double(sesnum);
@@ -347,6 +354,7 @@ function row = makeFileRow(pid, period, nGo, nNoGo, hits, fas, rt_sum, fpath, se
     row.hits        = double(hits);
     row.fas         = double(fas);
     row.rt_sum      = double(rt_sum);
+    row.rt_n        = double(rt_n);
     row.file        = string(fpath);
 end
 
