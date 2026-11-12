@@ -189,8 +189,8 @@ for k = 1:height(filemap)
     if ~any(valid); continue; end
     level = level(valid);  corr = corr(valid);  RT = RT(valid);
 
-    % Exclude RT==-99 from RT means (treat as missing)
-    RT(RT == -99) = NaN;
+    % Exclude missing and implausibly fast RTs from RT means only.
+    RT(RT == -99 | RT < 200) = NaN;
 
     % Per-level counts for this file
     ulev = unique(level(:)');  % row vector
@@ -204,8 +204,10 @@ for k = 1:height(filemap)
 
         rt_hit_sum = sum(RT(mask & corr==1), 'omitnan');
         rt_fa_sum  = sum(RT(mask & corr==2), 'omitnan');
+        rt_hit_n   = sum(mask & corr==1 & isfinite(RT));
+        rt_fa_n    = sum(mask & corr==2 & isfinite(RT));
 
-        rows = [rows; makeFileRow(pid, period, L, hits, fas, miss, cr, rt_hit_sum, rt_fa_sum)];
+        rows = [rows; makeFileRow(pid, period, L, hits, fas, miss, cr, rt_hit_sum, rt_fa_sum, rt_hit_n, rt_fa_n)];
     end
 end
 
@@ -222,10 +224,12 @@ A.miss       = splitapply(@nansum, file_tbl.miss,        grp);
 A.cr         = splitapply(@nansum, file_tbl.cr,          grp);
 A.rt_hit_sum = splitapply(@nansum, file_tbl.rt_hit_sum,  grp);
 A.rt_fa_sum  = splitapply(@nansum, file_tbl.rt_fa_sum,   grp);
+A.rt_hit_n   = splitapply(@nansum, file_tbl.rt_hit_n,    grp);
+A.rt_fa_n    = splitapply(@nansum, file_tbl.rt_fa_n,     grp);
 [pIDs, periods, levels] = splitapply(@firstTriple, file_tbl.participant, file_tbl.period, file_tbl.level, grp);
 
-metrics = table(pIDs, periods, levels, A.hits, A.fas, A.miss, A.cr, A.rt_hit_sum, A.rt_fa_sum, ...
-    'VariableNames', {'participant','period','level','hits','fas','miss','cr','rt_hit_sum','rt_fa_sum'});
+metrics = table(pIDs, periods, levels, A.hits, A.fas, A.miss, A.cr, A.rt_hit_sum, A.rt_fa_sum, A.rt_hit_n, A.rt_fa_n, ...
+    'VariableNames', {'participant','period','level','hits','fas','miss','cr','rt_hit_sum','rt_fa_sum','rt_hit_n','rt_fa_n'});
 
 % SDT rates (Hautus), z, d′
 nSignal = metrics.hits + metrics.miss;
@@ -237,10 +241,14 @@ metrics.zFA = safeNormInv(metrics.fa_rate_adj);
 metrics.dprime = metrics.zH - metrics.zFA;
 
 % Mean RTs (per condition)
-metrics.mean_rt_hit = metrics.rt_hit_sum ./ metrics.hits;
-metrics.mean_rt_hit(metrics.hits==0) = NaN;
-metrics.mean_rt_fa  = metrics.rt_fa_sum ./ metrics.fas;
-metrics.mean_rt_fa(metrics.fas==0) = NaN;
+metrics.mean_rt_hit = metrics.rt_hit_sum ./ metrics.rt_hit_n;
+metrics.mean_rt_hit(metrics.rt_hit_n==0) = NaN;
+metrics.mean_rt_fa  = metrics.rt_fa_sum ./ metrics.rt_fa_n;
+metrics.mean_rt_fa(metrics.rt_fa_n==0) = NaN;
+
+% Keep valid-RT counts internal so existing outputs retain their schemas.
+file_tbl_export = removevars(file_tbl, {'rt_hit_n','rt_fa_n'});
+metrics = removevars(metrics, {'rt_hit_n','rt_fa_n'});
 
 % Order periods robustly
 metrics.period = categorical(string(metrics.period));
@@ -251,7 +259,7 @@ metrics.period = reordercats(metrics.period, keep_order);
 metrics = sortrows(metrics, {'participant','period','level'});
 
 % Save CSV outputs
-writetable(file_tbl, csv_out_filelevel);
+writetable(file_tbl_export, csv_out_filelevel);
 writetable(metrics, csv_out_metrics);
 writetable(metrics, csv_out_all);
 fprintf('Metrics saved: %s\n', csv_out_metrics);
@@ -518,7 +526,7 @@ function z = safeNormInv(p)
     end
 end
 
-function row = makeFileRow(pid, period, level, hits, fas, miss, cr, rt_hit_sum, rt_fa_sum)
+function row = makeFileRow(pid, period, level, hits, fas, miss, cr, rt_hit_sum, rt_fa_sum, rt_hit_n, rt_fa_n)
     row.participant = string(pid);
     row.period      = string(period);
     row.level       = double(level);
@@ -528,6 +536,8 @@ function row = makeFileRow(pid, period, level, hits, fas, miss, cr, rt_hit_sum, 
     row.cr          = double(cr);
     row.rt_hit_sum  = double(rt_hit_sum);
     row.rt_fa_sum   = double(rt_fa_sum);
+    row.rt_hit_n    = double(rt_hit_n);
+    row.rt_fa_n     = double(rt_fa_n);
 end
 
 function [a,b,c] = firstTriple(A,B,C)
